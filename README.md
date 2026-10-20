@@ -55,8 +55,12 @@ Claude Code 세션에서:
 헤드리스(로컬 cron·launchd):
 
 ```sh
-cd <project repo> && claude -p --agent qa-breaker "<scope>"
+cd <project repo> && claude -p --agent qa-breaker \
+  --append-system-prompt-file ~/.claude/skills/qa-run/SKILL.md \
+  --add-dir="$HOME/.claude/skills/qa-run" "<scope>"
 ```
+
+`--agent`로 메인 스레드에서 돌릴 때는 에이전트의 `skills:` 미리 로드가 적용되지 않아(서브에이전트로 띄울 때만 적용) 절차를 직접 붙인다. `qa eval run`은 이렇게 한다.
 
 ### 기록과 판정
 
