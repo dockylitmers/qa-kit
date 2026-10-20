@@ -1,0 +1,1488 @@
+#!/usr/bin/env python3
+"""qa — command-line companion for qa-kit.
+
+Python standard library only. The LLM writes content; this script does
+format checks, ledger writes, deterministic stats and eval plumbing.
+
+  qa doctor                     installation check (exit 1 on any failure)
+  qa init <project>             create projects/<project>/ and evals/<project>/
+  qa check                      validate patterns, eval cases, run ledgers, leaks
+  qa pattern list|show|new|index
+  qa finding add|judge|applied|list
+  qa eval list|run <case>
+  qa sync                       pull/commit/push the knowledge repo
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VERSION = "0.1.0"
+KIT_DIR = Path(__file__).resolve().parent.parent
+HOME = Path(os.path.expanduser("~"))
+KB_REMOTE_SLUG = "dockylitmers/qa-knowledge"
+
+SKILLS = ["qa-run", "qa-retro"]
+AGENTS = ["qa-breaker", "qa-skeptic"]
+
+PATTERN_STATUS = {"candidate", "active", "probation", "needs_revalidation", "retired"}
+PATTERN_TIER = {"global", "project"}
+FAILURE_CLASS = {"boundary", "sad_path", "error_propagation", "concurrency"}
+SEVERITY = {"critical", "high", "medium", "low"}
+VERDICTS = {"accepted", "false_positive", "wont_fix", "duplicate"}
+EVIDENCE_LEVELS = {"L0", "L1", "L2", "L3", "L4", "L5"}
+PATTERN_REQUIRED = [
+    "id", "status", "tier", "failure_class", "title", "scope", "probe", "oracle",
+    "evidence_required", "false_positive_traps", "severity_prior", "stats",
+    "validity", "provenance", "eval_links",
+]
+STAT_KEYS = ["applied", "findings", "accepted", "false_positive", "wont_fix", "duplicate"]
+EVAL_REQUIRED = ["id", "pre_fix_commit", "scope", "failure_class", "expected_finding"]
+FP_TRAP_REQUIRED = ["id", "scope", "trap"]
+KB_DIRS = ["patterns", "projects", "evals", "evals/fp-traps", "inbox", "proposals"]
+
+PATTERN_ID_RE = re.compile(r"^PAT-[A-Za-z0-9][A-Za-z0-9-]*$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Internal record IDs from the owner's private notes must never land in the kit or KB.
+INTERNAL_ID_RE = re.compile(r"\b[DQTPBH]-[0-9a-f]{6}\b")
+SECRET_RES = [
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("API key", re.compile(r"\b(?:sk|rk|pk)[-_](?:live|test|proj|ant)[-_][A-Za-z0-9_-]{12,}")),
+    ("payment key", re.compile(r"\b(?:live|test)_(?:sk|ck|gck|gsk)_[A-Za-z0-9]{10,}")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.")),
+    ("credential assignment", re.compile(
+        r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|client[_-]?secret)\b\s*[:=]\s*['\"]?[^\s'\"<>{}]{8,}")),
+]
+# Global patterns must stay project-neutral: no code paths, no home paths, no emails.
+PATH_RES = [
+    ("code path", re.compile(
+        r"(?<![\w/.-])(?:\.{1,2}/)?(?:[\w@.-]+/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rb|go|java|kt|kts|swift|dart|php|cs|sql|prisma|vue|svelte)\b")),
+    ("home path", re.compile(r"(?:/Users/|/home/|~/)[\w.-]+")),
+    ("email address", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
+]
+
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"qa: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def stamp() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def run(cmd, cwd=None, check=False, capture=True, env=None, input=None, timeout=None):
+    return subprocess.run(
+        cmd, cwd=cwd, check=check, env=env, input=input, timeout=timeout,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None, text=True)
+
+
+# --------------------------------------------------------------------------
+# Minimal YAML subset (block maps/lists, flow [..] {..}, quoted and block scalars)
+# --------------------------------------------------------------------------
+
+class YamlError(ValueError):
+    pass
+
+
+def _strip_comment(s: str) -> str:
+    quote = None
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                continue
+        elif ch in "'\"" and (i == 0 or s[i - 1] in " \t[{,:"):
+            quote = ch
+        elif ch == "#" and (i == 0 or s[i - 1] in " \t"):
+            return s[:i].rstrip()
+    return s.rstrip()
+
+
+def _scalar(tok: str):
+    t = tok.strip()
+    if t == "" or t in ("~", "null", "Null", "NULL"):
+        return None
+    if t in ("true", "True", "TRUE"):
+        return True
+    if t in ("false", "False", "FALSE"):
+        return False
+    if t.startswith('"') and t.endswith('"') and len(t) >= 2:
+        try:
+            return json.loads(t)
+        except json.JSONDecodeError:
+            return t[1:-1]
+    if t.startswith("'") and t.endswith("'") and len(t) >= 2:
+        return t[1:-1].replace("''", "'")
+    if re.fullmatch(r"[-+]?\d+", t):
+        return int(t)
+    if re.fullmatch(r"[-+]?(\d+\.\d*|\.\d+)([eE][-+]?\d+)?", t):
+        return float(t)
+    return t
+
+
+def _parse_flow(s: str, i: int = 0):
+    """Parse a flow collection or scalar starting at s[i]; return (value, next_index)."""
+    def skip_ws(j):
+        while j < len(s) and s[j] in " \t\n":
+            j += 1
+        return j
+
+    def quoted(j):
+        q = s[j]
+        k = j + 1
+        while k < len(s):
+            if q == '"' and s[k] == "\\":
+                k += 2
+                continue
+            if s[k] == q:
+                if q == "'" and k + 1 < len(s) and s[k + 1] == "'":
+                    k += 2
+                    continue
+                return _scalar(s[j:k + 1]), k + 1
+            k += 1
+        raise YamlError(f"unterminated quote in: {s}")
+
+    def plain(j, stops):
+        k = j
+        while k < len(s) and s[k] not in stops:
+            if s[k] == ":" and ":" in stops and (k + 1 == len(s) or s[k + 1] in " ,]}"):
+                break
+            k += 1
+        return _scalar(s[j:k]), k
+
+    i = skip_ws(i)
+    if i >= len(s):
+        return None, i
+    ch = s[i]
+    if ch == "[":
+        out = []
+        i = skip_ws(i + 1)
+        while True:
+            if i >= len(s):
+                raise YamlError(f"unterminated [ in: {s}")
+            if s[i] == "]":
+                return out, i + 1
+            if s[i] in "[{":
+                v, i = _parse_flow(s, i)
+            elif s[i] in "'\"":
+                v, i = quoted(i)
+            else:
+                v, i = plain(i, ",]")
+            out.append(v)
+            i = skip_ws(i)
+            if i < len(s) and s[i] == ",":
+                i = skip_ws(i + 1)
+    if ch == "{":
+        out = {}
+        i = skip_ws(i + 1)
+        while True:
+            if i >= len(s):
+                raise YamlError(f"unterminated {{ in: {s}")
+            if s[i] == "}":
+                return out, i + 1
+            if s[i] in "'\"":
+                k, i = quoted(i)
+            else:
+                k, i = plain(i, ":,}")
+            i = skip_ws(i)
+            v = None
+            if i < len(s) and s[i] == ":":
+                i = skip_ws(i + 1)
+                if i < len(s) and s[i] in "[{":
+                    v, i = _parse_flow(s, i)
+                elif i < len(s) and s[i] in "'\"":
+                    v, i = quoted(i)
+                elif i < len(s) and s[i] not in ",}":
+                    v, i = plain(i, ",}")
+            out[str(k)] = v
+            i = skip_ws(i)
+            if i < len(s) and s[i] == ",":
+                i = skip_ws(i + 1)
+    if ch in "'\"":
+        return quoted(i)
+    return _scalar(s[i:]), len(s)
+
+
+_KEY_RE = re.compile(r"""^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"\[\]{}-][^:#]*?|-[^\s:#][^:#]*?)\s*:(?:\s+|$)(.*)$""")
+
+
+def _balanced(s: str) -> bool:
+    depth, quote = 0, None
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote and not (quote == '"' and i and s[i - 1] == "\\"):
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+    return depth <= 0
+
+
+class _Lines:
+    def __init__(self, text: str):
+        self.raw = text.replace("\t", "  ").split("\n")
+        self.i = 0
+
+    def peek(self):
+        """Next meaningful line as (indent, content) without consuming, or None."""
+        j = self.i
+        while j < len(self.raw):
+            content = _strip_comment(self.raw[j])
+            if content.strip() and content.strip() not in ("---", "..."):
+                return len(content) - len(content.lstrip()), content.strip(), j
+            j += 1
+        return None
+
+    def take(self, j):
+        self.i = j + 1
+
+
+def _block_scalar(lines: _Lines, parent_indent: int, style: str) -> str:
+    body, j = [], lines.i
+    block_indent = None
+    while j < len(lines.raw):
+        line = lines.raw[j]
+        if line.strip() == "":
+            body.append("")
+            j += 1
+            continue
+        ind = len(line) - len(line.lstrip())
+        if ind <= parent_indent:
+            break
+        if block_indent is None:
+            block_indent = ind
+        body.append(line[block_indent:] if ind >= block_indent else line.lstrip())
+        j += 1
+    lines.i = j
+    while body and body[-1] == "":
+        body.pop()
+    if style.startswith(">"):
+        text = " ".join(x for x in body if x) if body else ""
+    else:
+        text = "\n".join(body)
+    return text if style.endswith("-") else text + "\n"
+
+
+def _value_after_key(lines: _Lines, indent: int, rest: str):
+    rest = rest.strip()
+    if rest in ("|", "|-", "|+", ">", ">-", ">+"):
+        return _block_scalar(lines, indent, rest)
+    if rest == "":
+        nxt = lines.peek()
+        if nxt and (nxt[0] > indent or (nxt[0] == indent and nxt[1].startswith("- "))):
+            return _parse_block(lines, nxt[0])
+        return None
+    if rest[0] in "[{":
+        buf = rest
+        while not _balanced(buf) and lines.i < len(lines.raw):
+            buf += " " + _strip_comment(lines.raw[lines.i]).strip()
+            lines.i += 1
+        v, _ = _parse_flow(buf)
+        return v
+    return _scalar(rest)
+
+
+def _parse_block(lines: _Lines, indent: int):
+    first = lines.peek()
+    if first is None:
+        return None
+    if first[1] == "-" or first[1].startswith("- "):
+        out = []
+        while True:
+            nxt = lines.peek()
+            if not nxt or nxt[0] != indent or not (nxt[1] == "-" or nxt[1].startswith("- ")):
+                return out
+            ind, content, j = nxt
+            lines.take(j)
+            item = content[1:].lstrip()
+            col = ind + 1 + (len(content[1:]) - len(item))
+            if item == "":
+                n2 = lines.peek()
+                out.append(_parse_block(lines, n2[0]) if n2 and n2[0] > indent else None)
+            elif _KEY_RE.match(item) and not item.startswith(("[", "{", '"', "'")):
+                # "- key: value" starts a map whose keys sit at column `col`.
+                lines.i = j
+                lines.raw[j] = " " * col + item
+                out.append(_parse_block(lines, col))
+            else:
+                out.append(_value_after_key(lines, indent, item))
+    out = {}
+    while True:
+        nxt = lines.peek()
+        if not nxt or nxt[0] != indent or nxt[1].startswith("- "):
+            return out
+        ind, content, j = nxt
+        m = _KEY_RE.match(content)
+        if not m:
+            raise YamlError(f"line {j + 1}: expected 'key: value', got: {content}")
+        lines.take(j)
+        key = _scalar(m.group(1))
+        out[str(key)] = _value_after_key(lines, indent, m.group(2))
+        after = lines.peek()
+        if after and after[0] > indent:
+            raise YamlError(f"line {after[2] + 1}: unexpected indentation")
+
+
+def yaml_load(text: str):
+    lines = _Lines(text)
+    first = lines.peek()
+    if first is None:
+        return {}
+    return _parse_block(lines, first[0])
+
+
+def yaml_flow(v) -> str:
+    """Serialise a value in YAML flow style (used for stats lines and templates)."""
+    if v is None:
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(yaml_flow(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{k}: {yaml_flow(x)}" for k, x in v.items()) + "}"
+    s = str(v)
+    if s == "" or re.search(r"[:#,\[\]{}&*!|>'\"%@`]|^\s|\s$|^-", s) or _scalar(s) != s:
+        return json.dumps(s, ensure_ascii=False)
+    return s
+
+
+def split_front_matter(text: str):
+    """Return (front_matter_text, body, fm_start_line, fm_end_line) for a --- delimited file."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, text, None, None
+    for k in range(1, len(lines)):
+        if lines[k].strip() == "---":
+            return "\n".join(lines[1:k]), "\n".join(lines[k + 1:]), 1, k
+    return None, text, None, None
+
+
+# --------------------------------------------------------------------------
+# Knowledge base location and loading
+# --------------------------------------------------------------------------
+
+def settings_path() -> Path:
+    return HOME / ".claude" / "settings.json"
+
+
+def settings_qa_kb():
+    try:
+        data = json.loads(settings_path().read_text())
+        return (data.get("env") or {}).get("QA_KB")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def resolve_kb(arg=None, must_exist=True) -> Path:
+    for cand in (arg, os.environ.get("QA_KB"), settings_qa_kb(), str(HOME / "Workspace" / "qa-knowledge")):
+        if cand:
+            p = Path(os.path.expanduser(cand))
+            if p.is_dir() or not must_exist:
+                return p
+    die("knowledge repo not found; set QA_KB or run install.sh")
+
+
+def rel(kb: Path, p: Path) -> str:
+    try:
+        return str(p.relative_to(kb))
+    except ValueError:
+        return str(p)
+
+
+class Pattern:
+    def __init__(self, path: Path, meta: dict, body: str, text: str):
+        self.path, self.meta, self.body, self.text = path, meta, body, text
+
+    @property
+    def id(self):
+        return self.meta.get("id")
+
+
+def pattern_files(kb: Path):
+    files = sorted((kb / "patterns").glob("*.md"))
+    files += sorted(kb.glob("projects/*/patterns/*.md"))
+    return [f for f in files if f.name.upper() not in ("INDEX.MD", "README.MD")]
+
+
+def load_pattern(path: Path):
+    text = path.read_text(encoding="utf-8")
+    fm, body, _, _ = split_front_matter(text)
+    if fm is None:
+        raise YamlError("missing YAML front matter (--- ... ---)")
+    meta = yaml_load(fm)
+    if not isinstance(meta, dict):
+        raise YamlError("front matter is not a mapping")
+    return Pattern(path, meta, body, text)
+
+
+def load_patterns(kb: Path, errors=None):
+    out = []
+    for f in pattern_files(kb):
+        try:
+            out.append(load_pattern(f))
+        except (YamlError, OSError) as e:
+            if errors is not None:
+                errors.append(f"{rel(kb, f)}: {e}")
+    return out
+
+
+def find_pattern(kb: Path, pid: str) -> Pattern:
+    for p in load_patterns(kb):
+        if p.id == pid:
+            return p
+    die(f"pattern not found: {pid}")
+
+
+def eval_case_files(kb: Path):
+    out = []
+    for d in sorted((kb / "evals").iterdir()) if (kb / "evals").is_dir() else []:
+        if d.is_dir():
+            out += sorted(list(d.glob("*.yaml")) + list(d.glob("*.yml")))
+    return out
+
+
+def load_yaml_file(path: Path):
+    return yaml_load(path.read_text(encoding="utf-8"))
+
+
+def ledger_files(kb: Path):
+    return sorted(kb.glob("projects/*/runs/*/findings.jsonl"))
+
+
+def read_ledger(path: Path):
+    events = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.strip():
+            events.append((n, json.loads(line)))
+    return events
+
+
+# --------------------------------------------------------------------------
+# Leak scanning
+# --------------------------------------------------------------------------
+
+def load_denylist(kb: Path):
+    """Each non-comment line is a case-insensitive substring, or `re:<regex>`."""
+    entries = []
+    path = kb / ".qa-denylist"
+    if not path.exists():
+        return entries, False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("re:"):
+            entries.append((line, re.compile(line[3:], re.IGNORECASE)))
+        else:
+            entries.append((line, re.compile(re.escape(line), re.IGNORECASE)))
+    return entries, True
+
+
+def scan_text(text: str, rules):
+    hits = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for label, rx in rules:
+            m = rx.search(line)
+            if m:
+                hits.append((n, label, m.group(0)))
+    return hits
+
+
+def iter_kb_text_files(kb: Path):
+    for root, dirs, files in os.walk(kb):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in files:
+            p = Path(root) / name
+            if p.name == ".qa-denylist" or p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip"):
+                continue
+            yield p
+
+
+# --------------------------------------------------------------------------
+# Stats (deterministic, derived from run ledgers)
+# --------------------------------------------------------------------------
+
+def compute_stats(kb: Path):
+    stats = {}
+
+    def bucket(pid):
+        return stats.setdefault(pid, {"runs": set(), "findings": 0, "verdicts": {}, "last_hit_at": None})
+
+    for lf in ledger_files(kb):
+        run_key = str(lf.parent.relative_to(kb))
+        findings, judgments = {}, {}
+        for _, ev in read_ledger(lf):
+            t = ev.get("type")
+            if t == "applied":
+                for pid in ev.get("patterns", []):
+                    bucket(pid)["runs"].add(run_key)
+            elif t == "finding":
+                findings[ev["id"]] = ev
+            elif t == "judgment":
+                judgments[ev["finding"]] = ev  # latest judgment wins
+        for fid, f in findings.items():
+            j = judgments.get(fid)
+            for pid in f.get("patterns", []):
+                b = bucket(pid)
+                b["runs"].add(run_key)
+                b["findings"] += 1
+                if j:
+                    v = j["verdict"]
+                    b["verdicts"][v] = b["verdicts"].get(v, 0) + 1
+                    if v == "accepted":
+                        day = str(j.get("at", ""))[:10]
+                        if not b["last_hit_at"] or day > b["last_hit_at"]:
+                            b["last_hit_at"] = day
+    result = {}
+    for pid, b in stats.items():
+        s = {"applied": len(b["runs"]), "findings": b["findings"]}
+        for v in ("accepted", "false_positive", "wont_fix", "duplicate"):
+            s[v] = b["verdicts"].get(v, 0)
+        s["last_hit_at"] = b["last_hit_at"]
+        result[pid] = s
+    return result
+
+
+def _top_level_key_span(fm_lines, key):
+    """Line span [start, end) of a top-level key inside front matter lines."""
+    start = None
+    for i, line in enumerate(fm_lines):
+        if start is None:
+            if re.match(rf"^{re.escape(key)}\s*:", line):
+                start = i
+                rest = line.split(":", 1)[1]
+                if rest.strip().startswith(("{", "[")):
+                    buf, j = rest, i
+                    while not _balanced(_strip_comment(buf)) and j + 1 < len(fm_lines):
+                        j += 1
+                        buf += fm_lines[j]
+                    return start, j + 1
+                if rest.strip():
+                    return start, i + 1
+        elif line.strip() and not line.startswith((" ", "\t")):
+            return start, i
+    return (start, len(fm_lines)) if start is not None else (None, None)
+
+
+def write_stats(p: Pattern, new: dict) -> bool:
+    old = p.meta.get("stats") or {}
+    merged = {k: old[k] for k in old if k not in STAT_KEYS and k not in ("last_hit_at", "helpful", "harmful")}
+    full = {k: new.get(k, 0) for k in STAT_KEYS}
+    if "helpful" in old or "harmful" in old:
+        full["helpful"], full["harmful"] = new.get("accepted", 0), new.get("false_positive", 0)
+    full.update(merged)
+    full["last_hit_at"] = new.get("last_hit_at")
+    if all(old.get(k) == v for k, v in full.items()) and set(old) <= set(full):
+        return False
+    lines = p.text.split("\n")
+    fm, _, s, e = split_front_matter(p.text)
+    fm_lines = lines[s:e]
+    a, b = _top_level_key_span(fm_lines, "stats")
+    new_line = "stats: " + yaml_flow(full)
+    if a is None:
+        fm_lines.append(new_line)
+    else:
+        fm_lines[a:b] = [new_line]
+    out = "\n".join(lines[:s] + fm_lines + lines[e:])
+    p.path.write_text(out, encoding="utf-8")
+    p.text = out
+    return True
+
+
+def refresh_stats(kb: Path, only=None):
+    computed = compute_stats(kb)
+    changed = []
+    for p in load_patterns(kb):
+        if only is not None and p.id not in only:
+            continue
+        if write_stats(p, computed.get(p.id, {})):
+            changed.append(p.id)
+    return changed
+
+
+# --------------------------------------------------------------------------
+# INDEX.md
+# --------------------------------------------------------------------------
+
+def index_line(p: Pattern, base: Path) -> str:
+    m = p.meta
+    return (f"- `{m.get('id')}` [{m.get('status')} · {m.get('failure_class')} · {m.get('severity_prior')}] "
+            f"{m.get('title')} → {p.path.relative_to(base).as_posix()}")
+
+
+def build_index(kb: Path) -> dict:
+    """Return {path: content} for the global index and each project pattern index."""
+    pats = load_patterns(kb)
+    out = {}
+    glob_pats = [p for p in pats if p.path.parent == kb / "patterns"]
+    head = ("# Pattern index\n\n"
+            "One line per global pattern: `id` [status · failure_class · severity_prior] title → file.\n"
+            "Generated by `qa pattern index`; do not edit by hand.\n\n")
+    out[kb / "INDEX.md"] = head + "\n".join(index_line(p, kb) for p in glob_pats) + ("\n" if glob_pats else "")
+    for proj in sorted({p.path.parent.parent for p in pats if p.path.parent != kb / "patterns"}):
+        ps = [p for p in pats if p.path.parent.parent == proj]
+        out[proj / "patterns" / "INDEX.md"] = (
+            f"# {proj.name} pattern index\n\nGenerated by `qa pattern index`.\n\n"
+            + "\n".join(index_line(p, proj / "patterns") for p in ps) + "\n")
+    return out
+
+
+def write_index(kb: Path):
+    written = []
+    for path, content in build_index(kb).items():
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            path.write_text(content, encoding="utf-8")
+            written.append(rel(kb, path))
+    return written
+
+
+# --------------------------------------------------------------------------
+# qa check
+# --------------------------------------------------------------------------
+
+def check_pattern(kb: Path, p: Pattern, errors, warnings, ids):
+    where = rel(kb, p.path)
+    m = p.meta
+    for k in PATTERN_REQUIRED:
+        if k not in m:
+            errors.append(f"{where}: missing key '{k}'")
+    pid = m.get("id")
+    if pid:
+        if not PATTERN_ID_RE.match(str(pid)):
+            errors.append(f"{where}: id '{pid}' must look like PAT-<slug>")
+        if p.path.stem != pid:
+            errors.append(f"{where}: file name must be {pid}.md")
+        if pid in ids:
+            errors.append(f"{where}: duplicate id {pid} (also {ids[pid]})")
+        ids[pid] = where
+    for key, allowed in (("status", PATTERN_STATUS), ("tier", PATTERN_TIER),
+                         ("failure_class", FAILURE_CLASS), ("severity_prior", SEVERITY)):
+        if key in m and m[key] not in allowed:
+            errors.append(f"{where}: {key} '{m[key]}' not in {sorted(allowed)}")
+    in_global = p.path.parent == kb / "patterns"
+    if m.get("tier") == "global" and not in_global:
+        errors.append(f"{where}: tier global must live in patterns/")
+    if m.get("tier") == "project" and in_global:
+        errors.append(f"{where}: tier project must live in projects/<project>/patterns/")
+    for key in ("probe", "evidence_required", "false_positive_traps", "eval_links"):
+        if key in m and not isinstance(m[key], list):
+            errors.append(f"{where}: '{key}' must be a list")
+    if "scope" in m and not isinstance(m["scope"], dict):
+        errors.append(f"{where}: 'scope' must be a mapping")
+    st = m.get("stats")
+    if st is not None:
+        if not isinstance(st, dict):
+            errors.append(f"{where}: 'stats' must be a mapping")
+        else:
+            for k, v in st.items():
+                if k == "last_hit_at":
+                    if v is not None and not DATE_RE.match(str(v)):
+                        errors.append(f"{where}: stats.last_hit_at must be YYYY-MM-DD or null")
+                elif not isinstance(v, int) or v < 0:
+                    errors.append(f"{where}: stats.{k} must be a non-negative integer")
+    val = m.get("validity")
+    if isinstance(val, dict):
+        for k in ("created_at", "last_validated_at"):
+            if k in val and not DATE_RE.match(str(val[k])):
+                errors.append(f"{where}: validity.{k} must be YYYY-MM-DD")
+        if "ttl_days" in val and not isinstance(val["ttl_days"], int):
+            errors.append(f"{where}: validity.ttl_days must be an integer")
+    elif val is not None:
+        errors.append(f"{where}: 'validity' must be a mapping")
+    prov = m.get("provenance")
+    if isinstance(prov, dict):
+        if not isinstance(prov.get("distinct_projects", 0), int):
+            errors.append(f"{where}: provenance.distinct_projects must be an integer")
+        extra = set(prov) - {"distinct_projects"}
+        if in_global and extra:
+            errors.append(f"{where}: global provenance may only hold distinct_projects (found {sorted(extra)})")
+    if m.get("status") == "active" and isinstance(prov, dict) and prov.get("distinct_projects", 0) < 1:
+        warnings.append(f"{where}: active pattern with provenance.distinct_projects 0")
+    if not p.body.strip():
+        warnings.append(f"{where}: empty body")
+
+
+def check_eval(kb: Path, path: Path, errors, warnings, ids, pattern_ids):
+    where = rel(kb, path)
+    try:
+        c = load_yaml_file(path)
+    except YamlError as e:
+        errors.append(f"{where}: {e}")
+        return
+    if not isinstance(c, dict):
+        errors.append(f"{where}: not a mapping")
+        return
+    is_trap = path.parent.name == "fp-traps"
+    for k in FP_TRAP_REQUIRED if is_trap else EVAL_REQUIRED:
+        if k not in c:
+            errors.append(f"{where}: missing key '{k}'")
+    cid = c.get("id")
+    if cid is not None:
+        if not CASE_ID_RE.match(str(cid)):
+            errors.append(f"{where}: bad id '{cid}'")
+        if path.stem != str(cid):
+            errors.append(f"{where}: file name must be {cid}{path.suffix}")
+        if cid in ids:
+            errors.append(f"{where}: duplicate case id {cid} (also {ids[cid]})")
+        ids[cid] = where
+    commit = c.get("pre_fix_commit") or c.get("commit")
+    if commit is not None and not COMMIT_RE.match(str(commit)):
+        errors.append(f"{where}: pre_fix_commit must be a 7-40 char hex sha")
+    if not is_trap and "failure_class" in c:
+        fc = c["failure_class"]
+        for v in fc if isinstance(fc, list) else [fc]:
+            if v not in FAILURE_CLASS:
+                warnings.append(f"{where}: failure_class '{v}' not in {sorted(FAILURE_CLASS)}")
+    sc = c.get("scope")
+    if sc is not None and not scope_paths(sc):
+        errors.append(f"{where}: scope must list at least one path (scope.paths or a list)")
+    if "difficulty" in c and c["difficulty"] not in (1, 2, 3):
+        errors.append(f"{where}: difficulty must be 1, 2 or 3")
+    ef = c.get("expected_finding")
+    if not is_trap and ef is not None and not (isinstance(ef, (dict, str)) and ef):
+        errors.append(f"{where}: expected_finding must be a non-empty mapping or string")
+    for lp in c.get("linked_patterns") or []:
+        if lp not in pattern_ids:
+            warnings.append(f"{where}: linked pattern {lp} not found")
+
+
+def check_ledger(kb: Path, lf: Path, errors):
+    where = rel(kb, lf)
+    seen = set()
+    try:
+        events = read_ledger(lf)
+    except ValueError as e:
+        errors.append(f"{where}: invalid JSON ({e})")
+        return
+    for n, ev in events:
+        t = ev.get("type")
+        if t == "applied":
+            if not isinstance(ev.get("patterns"), list):
+                errors.append(f"{where}:{n}: applied.patterns must be a list")
+        elif t == "finding":
+            for k in ("id", "title", "severity", "evidence", "at"):
+                if not ev.get(k):
+                    errors.append(f"{where}:{n}: finding missing '{k}'")
+            if ev.get("severity") not in SEVERITY:
+                errors.append(f"{where}:{n}: severity '{ev.get('severity')}' invalid")
+            if ev.get("evidence") not in EVIDENCE_LEVELS:
+                errors.append(f"{where}:{n}: evidence '{ev.get('evidence')}' not in L0..L5")
+            if ev.get("id") in seen:
+                errors.append(f"{where}:{n}: duplicate finding id {ev.get('id')}")
+            seen.add(ev.get("id"))
+        elif t == "judgment":
+            if ev.get("finding") not in seen:
+                errors.append(f"{where}:{n}: judgment for unknown finding {ev.get('finding')}")
+            if ev.get("verdict") not in VERDICTS:
+                errors.append(f"{where}:{n}: verdict '{ev.get('verdict')}' invalid")
+            if not ev.get("reason"):
+                errors.append(f"{where}:{n}: judgment needs a reason")
+            if ev.get("severity") not in SEVERITY:
+                errors.append(f"{where}:{n}: judgment needs a confirmed severity")
+        else:
+            errors.append(f"{where}:{n}: unknown event type '{t}'")
+
+
+def run_check(kb: Path):
+    errors, warnings = [], []
+    for d in KB_DIRS:
+        if not (kb / d).is_dir():
+            errors.append(f"missing directory {d}/")
+    deny, has_deny = load_denylist(kb)
+    if not has_deny:
+        errors.append(".qa-denylist missing (needed to keep global patterns client-neutral)")
+
+    pats = load_patterns(kb, errors)
+    ids = {}
+    for p in pats:
+        check_pattern(kb, p, errors, warnings, ids)
+    case_ids = {}
+    for f in eval_case_files(kb):
+        check_eval(kb, f, errors, warnings, case_ids, ids)
+    for lf in ledger_files(kb):
+        check_ledger(kb, lf, errors)
+
+    # Global patterns and the global index: no client names, code paths or secrets.
+    global_rules = [(f"denylist '{e}'", rx) for e, rx in deny] + PATH_RES
+    targets = [p.path for p in pats if p.path.parent == kb / "patterns"]
+    if (kb / "INDEX.md").exists():
+        targets.append(kb / "INDEX.md")
+    for t in targets:
+        for n, label, hit in scan_text(t.read_text(encoding="utf-8"), global_rules):
+            errors.append(f"{rel(kb, t)}:{n}: {label} in global pattern: {hit!r}")
+    # Everywhere: no internal record IDs, no secrets.
+    for f in iter_kb_text_files(kb):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, label, hit in scan_text(text, [("internal record id", INTERNAL_ID_RE)] + SECRET_RES):
+            errors.append(f"{rel(kb, f)}:{n}: {label}: {hit[:12]}…")
+
+    expected = build_index(kb) if not errors else {}
+    for path, content in expected.items():
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            warnings.append(f"{rel(kb, path)} is stale; run `qa pattern index`")
+    if (kb / "INDEX.md").exists() and len((kb / "INDEX.md").read_text().splitlines()) > 300:
+        warnings.append("INDEX.md is over 300 lines; consider retiring or merging patterns")
+    return errors, warnings
+
+
+def cmd_check(args):
+    kb = resolve_kb(args.kb)
+    errors, warnings = run_check(kb)
+    for w in warnings:
+        print(f"WARN  {w}")
+    for e in errors:
+        print(f"ERROR {e}")
+    n_p = len(pattern_files(kb))
+    n_e = len(eval_case_files(kb))
+    n_l = len(ledger_files(kb))
+    print(f"qa check: {n_p} patterns, {n_e} eval cases, {n_l} run ledgers — "
+          f"{len(errors)} errors, {len(warnings)} warnings")
+    return 1 if errors else 0
+
+
+# --------------------------------------------------------------------------
+# qa doctor
+# --------------------------------------------------------------------------
+
+def cmd_doctor(args):
+    results = []
+
+    def report(ok, name, detail="", level="FAIL"):
+        tag = "ok  " if ok else level
+        results.append(ok or level == "WARN")
+        print(f"[{tag}] {name}" + (f" — {detail}" if detail else ""))
+
+    report(sys.version_info >= (3, 9), "python >= 3.9", sys.version.split()[0])
+    for s in SKILLS:
+        src = KIT_DIR / "skills" / s
+        for base in (HOME / ".claude" / "skills", HOME / ".agents" / "skills"):
+            dst = base / s
+            ok = dst.is_symlink() and dst.resolve() == src.resolve() and (dst / "SKILL.md").exists()
+            report(ok, f"skill link {dst}", "" if ok else f"expected symlink to {src}; run install.sh")
+    for a in AGENTS:
+        src = KIT_DIR / "agents" / f"{a}.md"
+        dst = HOME / ".claude" / "agents" / f"{a}.md"
+        ok = dst.is_symlink() and dst.resolve() == src.resolve()
+        report(ok, f"agent link {dst}", "" if ok else f"expected symlink to {src}; run install.sh")
+    found = shutil.which("qa")
+    ok = bool(found) and Path(found).resolve() == Path(__file__).resolve()
+    report(ok, "qa on PATH", found or "not found; add ~/.local/bin to PATH")
+
+    kb_setting = settings_qa_kb()
+    report(bool(kb_setting), "~/.claude/settings.json env.QA_KB", kb_setting or "not set; run install.sh")
+    env_kb = os.environ.get("QA_KB")
+    if env_kb and kb_setting and Path(env_kb).expanduser() != Path(kb_setting).expanduser():
+        report(False, "QA_KB environment matches settings", f"env={env_kb} settings={kb_setting}", level="WARN")
+    kb = Path(os.path.expanduser(args.kb or env_kb or kb_setting or str(HOME / "Workspace" / "qa-knowledge")))
+    is_repo = (kb / ".git").exists()
+    report(is_repo, "knowledge repo clone", str(kb) if is_repo else f"{kb} is not a git clone")
+    if is_repo:
+        remote = run(["git", "-C", str(kb), "remote", "get-url", "origin"]).stdout.strip()
+        report(KB_REMOTE_SLUG in remote, "knowledge repo remote", remote or "no origin")
+        missing = [d for d in KB_DIRS if not (kb / d).is_dir()]
+        report(not missing, "knowledge repo layout", f"missing {missing}" if missing else "")
+        report((kb / ".qa-denylist").exists(), "knowledge repo .qa-denylist")
+        if not args.offline:
+            f = run(["git", "-C", str(kb), "fetch", "--quiet", "origin"], timeout=60)
+            report(f.returncode == 0, "git fetch origin", f.stderr.strip()[:200])
+        br = run(["git", "-C", str(kb), "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        up = run(["git", "-C", str(kb), "rev-list", "--left-right", "--count", f"HEAD...origin/{br}"])
+        if up.returncode == 0:
+            ahead, behind = (int(x) for x in up.stdout.split())
+            report(ahead == 0 and behind == 0, "knowledge repo in sync with origin",
+                   f"ahead {ahead}, behind {behind}; run `qa sync`" if (ahead or behind) else f"branch {br}")
+        else:
+            report(False, "knowledge repo in sync with origin", f"no origin/{br}; run `qa sync`")
+        dirty = run(["git", "-C", str(kb), "status", "--porcelain"]).stdout.strip()
+        report(not dirty, "knowledge repo clean", f"{len(dirty.splitlines())} uncommitted changes; `qa sync` when ready", level="WARN")
+    report(bool(shutil.which("claude")), "claude CLI", shutil.which("claude") or "not found (needed for qa eval run)", level="WARN")
+    report(bool(shutil.which("gh")), "gh CLI", shutil.which("gh") or "not found (needed to clone)", level="WARN")
+    bad = results.count(False)
+    print(f"qa doctor: {'all checks passed' if not bad else f'{bad} problem(s)'}")
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------------------
+# qa init
+# --------------------------------------------------------------------------
+
+def cmd_init(args):
+    kb = resolve_kb(args.kb)
+    proj = args.project
+    if not SLUG_RE.match(proj):
+        die("project name must be lowercase letters, digits and dashes")
+    pdir, edir = kb / "projects" / proj, kb / "evals" / proj
+    for d in (pdir / "patterns", pdir / "runs", edir / "results"):
+        d.mkdir(parents=True, exist_ok=True)
+        keep = d / ".gitkeep"
+        if not any(d.iterdir()):
+            keep.touch()
+    pyaml = pdir / "project.yaml"
+    if not pyaml.exists():
+        repos = yaml_flow([args.repo]) if args.repo else "[]"
+        pyaml.write_text(
+            f"name: {proj}\n"
+            f"created_at: {today()}\n"
+            "# Local clone locations tried by `qa eval run` (first existing wins). Use ~ for home.\n"
+            f"repo_paths: {repos}\n"
+            "# Test accounts, seed data and won't-fix policy go in notes.md, never secrets.\n",
+            encoding="utf-8")
+    notes = pdir / "notes.md"
+    if not notes.exists():
+        notes.write_text(
+            f"# {proj} — project knowledge\n\n"
+            "Project-only knowledge (layer L1). Never copied into global patterns.\n\n"
+            "## Environments and test accounts\n\n(names only; secrets stay out of this repo)\n\n"
+            "## Won't-fix policy\n\n## Notes\n", encoding="utf-8")
+    print(f"initialised {rel(kb, pdir)}/ and {rel(kb, edir)}/")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# qa pattern
+# --------------------------------------------------------------------------
+
+PATTERN_TEMPLATE = """---
+id: {id}
+status: candidate          # candidate | active | probation | needs_revalidation | retired
+tier: {tier}               # global | project
+failure_class: {failure_class}   # boundary | sad_path | error_propagation | concurrency
+title: {title}
+scope: {{domains: [], frameworks: {{}}, preconditions: []}}
+probe: []
+oracle: TODO
+evidence_required: [failing_repro_test]
+false_positive_traps: []
+severity_prior: {severity}
+stats: {{applied: 0, findings: 0, accepted: 0, false_positive: 0, wont_fix: 0, duplicate: 0, last_hit_at: null}}
+validity: {{created_at: {today}, last_validated_at: {today}, ttl_days: 180}}
+provenance: {{distinct_projects: 0}}
+eval_links: []
+---
+
+## 무엇이 무너지는가
+
+## 코드에서 볼 곳 (일반 모양)
+
+## 증명 방법
+
+## 흔한 오탐
+"""
+
+
+def cmd_pattern(args):
+    kb = resolve_kb(args.kb)
+    if args.action == "list":
+        errs = []
+        pats = load_patterns(kb, errs)
+        for e in errs:
+            print(f"ERROR {e}", file=sys.stderr)
+        rows = []
+        for p in pats:
+            m = p.meta
+            if args.status and m.get("status") != args.status:
+                continue
+            if args.tier and m.get("tier") != args.tier:
+                continue
+            if args.cls and m.get("failure_class") != args.cls:
+                continue
+            st = m.get("stats") or {}
+            rows.append((m.get("id"), m.get("status"), m.get("tier"), m.get("failure_class"),
+                         m.get("severity_prior"), f"{st.get('accepted', 0)}/{st.get('false_positive', 0)}",
+                         m.get("title")))
+        if args.json:
+            keys = ["id", "status", "tier", "failure_class", "severity_prior", "accepted/fp", "title"]
+            print(json.dumps([dict(zip(keys, r)) for r in rows], ensure_ascii=False, indent=1))
+        else:
+            for r in rows:
+                print("  ".join(str(x) for x in r))
+            print(f"{len(rows)} patterns")
+        return 0
+    if args.action == "show":
+        if not args.id:
+            die("usage: qa pattern show <id>")
+        print(find_pattern(kb, args.id).text)
+        return 0
+    if args.action == "index":
+        written = write_index(kb)
+        print("updated " + ", ".join(written) if written else "index up to date")
+        return 0
+    if args.action == "new":
+        pid = args.id
+        if not pid or not PATTERN_ID_RE.match(pid):
+            die("usage: qa pattern new PAT-<slug> [--title ...] (lowercase slug recommended)")
+        if any(p.id == pid for p in load_patterns(kb)):
+            die(f"pattern {pid} already exists")
+        if args.project:
+            if not (kb / "projects" / args.project).is_dir():
+                die(f"unknown project {args.project}; run `qa init {args.project}`")
+            dest, tier = kb / "projects" / args.project / "patterns" / f"{pid}.md", "project"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            dest, tier = kb / "patterns" / f"{pid}.md", "global"
+        if args.cls not in (None, *FAILURE_CLASS):
+            die(f"--class must be one of {sorted(FAILURE_CLASS)}")
+        dest.write_text(PATTERN_TEMPLATE.format(
+            id=pid, tier=tier, failure_class=args.cls or "boundary",
+            title=yaml_flow(args.title or "TODO"), severity=args.severity or "medium", today=today()),
+            encoding="utf-8")
+        write_index(kb)
+        print(rel(kb, dest))
+        return 0
+    die(f"unknown pattern action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# qa finding
+# --------------------------------------------------------------------------
+
+def ledger_path(kb: Path, project: str, run_id: str, create=False) -> Path:
+    if not SLUG_RE.match(project):
+        die("bad project name")
+    if not CASE_ID_RE.match(run_id):
+        die("run id may contain letters, digits, '.', '_' and '-'")
+    pdir = kb / "projects" / project
+    if not pdir.is_dir():
+        die(f"unknown project {project}; run `qa init {project}` first")
+    path = pdir / "runs" / run_id / "findings.jsonl"
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    elif not path.exists():
+        die(f"no ledger at {rel(kb, path)}")
+    return path
+
+
+def split_list(v):
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
+
+
+def known_pattern_ids(kb: Path):
+    return {p.id for p in load_patterns(kb)}
+
+
+def append_event(path: Path, ev: dict):
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(ev, ensure_ascii=False, sort_keys=False) + "\n")
+
+
+def cmd_finding(args):
+    kb = resolve_kb(args.kb)
+    if args.action == "list":
+        lf = ledger_path(kb, args.project, args.run)
+        findings, judgments = {}, {}
+        for _, ev in read_ledger(lf):
+            if ev["type"] == "finding":
+                findings[ev["id"]] = ev
+            elif ev["type"] == "judgment":
+                judgments[ev["finding"]] = ev
+        for fid, f in findings.items():
+            j = judgments.get(fid)
+            verdict = f"{j['verdict']} ({j['severity']})" if j else "untriaged"
+            print(f"{fid}  {f['severity']:<8} {f['evidence']}  {verdict:<24} {f['title']}")
+        return 0
+
+    patterns = split_list(getattr(args, "patterns", ""))
+    if patterns:
+        unknown = sorted(set(patterns) - known_pattern_ids(kb))
+        if unknown:
+            die(f"unknown pattern ids: {', '.join(unknown)}")
+
+    if args.action == "applied":
+        lf = ledger_path(kb, args.project, args.run, create=True)
+        append_event(lf, {"type": "applied", "patterns": patterns, "at": now_iso()})
+        changed = refresh_stats(kb, set(patterns))
+        print(f"recorded {len(patterns)} applied pattern(s); stats updated: {', '.join(changed) or 'none'}")
+        return 0
+
+    if args.action == "add":
+        if args.severity not in SEVERITY:
+            die(f"--severity must be one of {sorted(SEVERITY)}")
+        if args.evidence not in EVIDENCE_LEVELS:
+            die("--evidence must be one of L0..L5")
+        lf = ledger_path(kb, args.project, args.run, create=True)
+        existing = [ev for _, ev in read_ledger(lf) if ev.get("type") == "finding"]
+        fid = f"F{len(existing) + 1:03d}"
+        ev = {"type": "finding", "id": fid, "title": args.title, "severity": args.severity,
+              "evidence": args.evidence, "failure_class": args.cls, "location": args.location,
+              "patterns": patterns, "out_of_pattern": not patterns, "summary": args.summary,
+              "at": now_iso()}
+        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
+        refresh_stats(kb, set(patterns))
+        print(f"{fid} added to {rel(kb, lf)}")
+        return 0
+
+    if args.action == "judge":
+        if args.verdict not in VERDICTS:
+            die(f"--verdict must be one of {sorted(VERDICTS)}")
+        if args.severity not in SEVERITY:
+            die(f"--severity (confirmed) must be one of {sorted(SEVERITY)}")
+        if not args.reason:
+            die("--reason is required")
+        lf = ledger_path(kb, args.project, args.run)
+        finding = None
+        for _, ev in read_ledger(lf):
+            if ev.get("type") == "finding" and ev.get("id") == args.finding:
+                finding = ev
+        if not finding:
+            die(f"finding {args.finding} not in {rel(kb, lf)}")
+        ev = {"type": "judgment", "finding": args.finding, "verdict": args.verdict,
+              "reason": args.reason, "severity": args.severity, "by": args.by,
+              "duplicate_of": args.duplicate_of, "at": now_iso()}
+        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
+        changed = refresh_stats(kb, set(finding.get("patterns", [])))
+        print(f"{args.finding}: {args.verdict}; stats updated: {', '.join(changed) or 'none'}")
+        return 0
+    die(f"unknown finding action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# qa eval
+# --------------------------------------------------------------------------
+
+def scope_paths(sc):
+    if isinstance(sc, list):
+        return [str(x) for x in sc]
+    if isinstance(sc, dict):
+        paths = sc.get("paths") or sc.get("files") or []
+        return [str(x) for x in paths] if isinstance(paths, list) else [str(paths)]
+    return []
+
+
+def find_case(kb: Path, case: str, project=None):
+    hits = []
+    for f in eval_case_files(kb):
+        if f.stem == case and (project is None or f.parent.name == project):
+            hits.append(f)
+    if not hits:
+        die(f"eval case not found: {case}")
+    if len(hits) > 1:
+        die(f"case id {case} exists in several projects; pass --project")
+    return hits[0]
+
+
+def resolve_repo(kb: Path, project: str, arg=None) -> Path:
+    cands = [arg, os.environ.get(f"QA_REPO_{project.upper().replace('-', '_')}")]
+    pyaml = kb / "projects" / project / "project.yaml"
+    if pyaml.exists():
+        cands += list(load_yaml_file(pyaml).get("repo_paths") or [])
+    for c in cands:
+        if c:
+            p = Path(os.path.expanduser(str(c)))
+            if (p / ".git").exists():
+                return p
+    die(f"no local clone for {project}; pass --repo, set QA_REPO_{project.upper()}, "
+        f"or add repo_paths to projects/{project}/project.yaml")
+
+
+def eval_prompt(case: dict) -> str:
+    """Build the run prompt from the scope ONLY (never issue text, numbers or expected_finding)."""
+    sc = case.get("scope")
+    feature = sc.get("feature") or sc.get("name") if isinstance(sc, dict) else None
+    lines = ["Failure-focused QA run on this repository snapshot (evaluation mode)."]
+    if feature:
+        lines.append(f"Feature in scope: {feature}")
+    lines.append("Start from these paths (follow calls outward as needed):")
+    lines += [f"- {p}" for p in scope_paths(sc)]
+    lines += [
+        "",
+        "Rules for this run:",
+        "- Read-only: do not modify files, install dependencies or use the network.",
+        "- Follow the qa-run procedure, steps 1-6, at evidence level L0 (file:line code evidence).",
+        "- Spend about a quarter of your effort outside known patterns.",
+        "- Finish with a ranked list of at most 5 defect candidates. For each: title, location (file and "
+        "function), trigger -> propagation -> visible failure, severity, evidence (file:line), and what "
+        "would refute it.",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_eval(args):
+    kb = resolve_kb(args.kb)
+    if args.action == "list":
+        for f in eval_case_files(kb):
+            if args.project and f.parent.name != args.project:
+                continue
+            try:
+                c = load_yaml_file(f)
+            except YamlError as e:
+                print(f"{rel(kb, f)}: ERROR {e}")
+                continue
+            res_dir = kb / "evals" / f.parent.name / "results"
+            runs = sorted(res_dir.glob(f"{f.stem}-*.md")) if res_dir.is_dir() else []
+            kind = "fp-trap" if f.parent.name == "fp-traps" else f.parent.name
+            fc = c.get("failure_class")
+            print(f"{c.get('id', f.stem)}  {kind}  {','.join(fc) if isinstance(fc, list) else fc}  "
+                  f"d{c.get('difficulty', '?')}  runs:{len(runs)}")
+        return 0
+
+    if args.action != "run":
+        die(f"unknown eval action {args.action}")
+    if not args.case:
+        die("usage: qa eval run <case>")
+    cf = find_case(kb, args.case, args.project)
+    project = cf.parent.name
+    if project == "fp-traps":
+        die("fp-trap cases need --project-specific repo; run them from evals/<project>/ for now")
+    case = load_yaml_file(cf)
+    commit = str(case.get("pre_fix_commit"))
+    repo = resolve_repo(kb, project, args.repo)
+    if run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+        die(f"commit {commit} not found in {repo}")
+
+    base = Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
+    started = stamp()
+    work = base / f"{case['id']}-{started}"
+    work.mkdir(parents=True, exist_ok=False)
+    # History-free snapshot: git archive + fresh git init, so future commits and issue numbers are invisible.
+    arch = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
+    tar = subprocess.run(["tar", "-x", "-C", str(work)], stdin=arch.stdout)
+    arch.stdout.close()
+    if arch.wait() != 0 or tar.returncode != 0:
+        die("git archive failed")
+    genv = dict(os.environ, GIT_AUTHOR_NAME="qa-eval", GIT_AUTHOR_EMAIL="qa-eval@localhost",
+                GIT_COMMITTER_NAME="qa-eval", GIT_COMMITTER_EMAIL="qa-eval@localhost",
+                GIT_AUTHOR_DATE="2000-01-01T00:00:00Z", GIT_COMMITTER_DATE="2000-01-01T00:00:00Z")
+    run(["git", "init", "-q"], cwd=work, check=True)
+    run(["git", "add", "-A"], cwd=work, check=True)
+    run(["git", "commit", "-q", "--no-gpg-sign", "-m", "snapshot"], cwd=work, env=genv, check=True)
+
+    prompt = eval_prompt(case)
+    cmd = ["claude", "-p", "--agent", "qa-breaker", "--permission-mode", "dontAsk",
+           "--tools", "Read,Grep,Glob", "--output-format", "text", "--no-session-persistence"]
+    if args.model:
+        cmd += ["--model", args.model]
+    if args.max_budget:
+        cmd += ["--max-budget-usd", str(args.max_budget)]
+    cmd.append(prompt)
+
+    if args.dry_run:
+        print(f"snapshot: {work}\ncommand: {' '.join(cmd[:-1])} <prompt>\n--- prompt ---\n{prompt}")
+        return 0
+
+    print(f"running qa-breaker on {case['id']} in {work} (timeout {args.timeout} min)…", file=sys.stderr)
+    t0 = dt.datetime.now()
+    try:
+        r = run(cmd, cwd=work, timeout=args.timeout * 60, env=dict(os.environ, QA_EVAL="1"))
+        out, err, code = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err, code = f"timed out after {args.timeout} min", 124
+    secs = int((dt.datetime.now() - t0).total_seconds())
+
+    ef = case.get("expected_finding")
+    if isinstance(ef, dict):
+        exp_loc = ef.get("location") or ef.get("where") or ""
+        exp_sym = ef.get("symptom") or ef.get("what") or ""
+        if not (exp_loc or exp_sym):
+            exp_sym = json.dumps(ef, ensure_ascii=False)
+    else:
+        exp_loc, exp_sym = "", str(ef or "")
+    res_dir = kb / "evals" / project / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    res = res_dir / f"{case['id']}-{started}.md"
+    res.write_text(f"""# Eval result: {case['id']}
+
+| | |
+|---|---|
+| case | `{rel(kb, cf)}` |
+| pre_fix_commit | `{commit}` |
+| failure_class | {case.get('failure_class')} |
+| difficulty | {case.get('difficulty', '?')} |
+| started | {started} |
+| duration | {secs}s |
+| exit code | {code} |
+| agent | qa-breaker (tools Read, Grep, Glob; dontAsk) |
+| model | {args.model or 'default'} |
+| host | {socket.gethostname().split('.')[0]} |
+| snapshot | `{work}` |
+
+## Prompt given to the agent (scope only)
+
+```text
+{prompt}
+```
+
+## Grading (human, v0)
+
+| | Expected (hidden from the agent) | Agent found it? |
+|---|---|---|
+| location | {exp_loc} | [ ] yes  [ ] partial  [ ] no |
+| symptom | {exp_sym} | [ ] yes  [ ] partial  [ ] no |
+
+Oracle idea: {case.get('oracle', '')}
+
+Linked patterns: {', '.join(case.get('linked_patterns') or []) or '-'}
+
+Verdict: `hit | partial | miss` — grader: — notes:
+
+## Agent output
+
+{out.strip() or '(no output)'}
+""" + (f"\n## stderr\n\n```text\n{err.strip()[:4000]}\n```\n" if err and err.strip() else ""), encoding="utf-8")
+    print(rel(kb, res))
+    if not args.keep and code == 0:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0 if code == 0 else 1
+
+
+# --------------------------------------------------------------------------
+# qa sync
+# --------------------------------------------------------------------------
+
+def cmd_sync(args):
+    kb = resolve_kb(args.kb)
+    git = lambda *a, **k: run(["git", "-C", str(kb), *a], **k)
+    errors, _ = run_check(kb)
+    if errors and not args.force:
+        for e in errors[:20]:
+            print(f"ERROR {e}")
+        die(f"qa check found {len(errors)} errors; fix them or pass --force", 1)
+    if git("status", "--porcelain").stdout.strip():
+        git("add", "-A", check=True)
+        msg = args.message or f"chore: sync {socket.gethostname().split('.')[0]} {today()}"
+        r = git("commit", "-q", "-m", msg)
+        if r.returncode != 0:
+            die(r.stderr.strip() or r.stdout.strip())
+        print(f"committed: {msg}")
+    r = git("pull", "--rebase", "--quiet", "origin", "HEAD")
+    if r.returncode != 0:
+        die("pull failed: " + (r.stderr.strip() or r.stdout.strip()))
+    changed = refresh_stats(kb)
+    if changed or write_index(kb):
+        git("add", "-A", check=True)
+        git("commit", "-q", "-m", "chore: refresh pattern stats and index", check=True)
+    if args.no_push:
+        print("pulled (push skipped)")
+        return 0
+    r = git("push", "--quiet", "origin", "HEAD")
+    if r.returncode != 0:
+        die("push failed: " + (r.stderr.strip() or r.stdout.strip()))
+    print("knowledge repo in sync")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qa", description="qa-kit companion CLI")
+    ap.add_argument("--kb", help="knowledge repo path (default: $QA_KB, then settings.json env.QA_KB)")
+    ap.add_argument("--version", action="version", version=f"qa {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("doctor", help="check the installation")
+    p.add_argument("--offline", action="store_true", help="skip git fetch")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("init", help="create project folders in the knowledge repo")
+    p.add_argument("project")
+    p.add_argument("--repo", help="local clone path to record in project.yaml")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("check", help="validate the knowledge repo")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("pattern", help="list|show|new|index patterns")
+    p.add_argument("action", choices=["list", "show", "new", "index"])
+    p.add_argument("id", nargs="?")
+    p.add_argument("--title")
+    p.add_argument("--class", dest="cls")
+    p.add_argument("--severity", choices=sorted(SEVERITY))
+    p.add_argument("--project", help="create a project-tier pattern under projects/<project>/patterns/")
+    p.add_argument("--status")
+    p.add_argument("--tier")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_pattern)
+
+    p = sub.add_parser("finding", help="add|judge|applied|list findings in a run ledger")
+    p.add_argument("action", choices=["add", "judge", "applied", "list"])
+    p.add_argument("--project", required=True)
+    p.add_argument("--run", required=True, help="run id, e.g. 2026-10-21-payments")
+    p.add_argument("--title")
+    p.add_argument("--severity", help="critical|high|medium|low (judge: confirmed severity)")
+    p.add_argument("--evidence", help="L0..L5")
+    p.add_argument("--class", dest="cls")
+    p.add_argument("--location", help="file:line or file#function")
+    p.add_argument("--patterns", help="comma-separated pattern ids")
+    p.add_argument("--summary")
+    p.add_argument("--finding", help="finding id for judge, e.g. F001")
+    p.add_argument("--verdict", help="accepted|false_positive|wont_fix|duplicate")
+    p.add_argument("--reason")
+    p.add_argument("--by", help="who judged")
+    p.add_argument("--duplicate-of")
+    p.set_defaults(fn=cmd_finding)
+
+    p = sub.add_parser("eval", help="list|run replay eval cases")
+    p.add_argument("action", choices=["list", "run"])
+    p.add_argument("case", nargs="?")
+    p.add_argument("--project")
+    p.add_argument("--repo", help="local clone of the project repo")
+    p.add_argument("--timeout", type=int, default=30, help="minutes (default 30)")
+    p.add_argument("--model")
+    p.add_argument("--max-budget", type=float, help="USD cap passed to claude --max-budget-usd")
+    p.add_argument("--keep", action="store_true", help="keep the snapshot folder after a successful run")
+    p.add_argument("--dry-run", action="store_true", help="prepare the snapshot and print the prompt only")
+    p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("sync", help="commit, pull --rebase and push the knowledge repo")
+    p.add_argument("-m", "--message")
+    p.add_argument("--no-push", action="store_true")
+    p.add_argument("--force", action="store_true", help="sync even if qa check fails")
+    p.set_defaults(fn=cmd_sync)
+
+    args = ap.parse_args(argv)
+    if args.cmd == "finding" and args.action == "add" and not args.title:
+        die("finding add needs --title, --severity and --evidence")
+    try:
+        return args.fn(args) or 0
+    except YamlError as e:
+        die(f"YAML error: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

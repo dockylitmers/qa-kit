@@ -1,0 +1,11 @@
+{
+  "name": "qa-kit",
+  "version": "0.1.0",
+  "description": "Failure-focused QA agent kit: qa-run and qa-retro skills, qa-breaker and qa-skeptic subagents, and the qa CLI for patterns, run ledgers and replay evals.",
+  "author": {
+    "name": "dockylitmers"
+  },
+  "repository": "https://github.com/dockylitmers/qa-kit",
+  "license": "UNLICENSED",
+  "keywords": ["qa", "testing", "failure-modes", "chaos", "evals"]
+}
