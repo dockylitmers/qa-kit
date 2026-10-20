@@ -101,8 +101,11 @@ qa eval list [--project <p>]
 qa eval run <case> [--repo <clone>] [--timeout 30] [--max-budget 5] [--keep] [--dry-run]
 ```
 
-- 사례의 `pre_fix_commit`을 `git archive`로 이력 없이 `~/Workspace/.qa-eval/<project>-<사례 해시>-<시각>/`에 풀고 `git init`(미래 커밋·이슈 번호가 보이지 않게). 폴더 이름은 사례 ID 대신 해시를 쓴다(사례 ID에 이슈 번호·증상이 들어 있어 에이전트가 작업 폴더 이름으로 답을 볼 수 있음). 사례와 폴더의 대응은 결과 파일에 적힌다.
+- 사례의 `pre_fix_commit`을 `git archive`로 이력 없이 `~/Workspace/.qa-eval/w-<무작위>/`에 풀고 `git init`(미래 커밋·이슈 번호가 보이지 않게). 폴더 이름은 사례 ID 대신 해시를 쓴다(사례 ID에 이슈 번호·증상이 들어 있어 에이전트가 작업 폴더 이름으로 답을 볼 수 있음). 사례와 폴더의 대응은 결과 파일에 적힌다.
 - 스냅샷 안의 프로젝트 설정·훅은 읽지 않는다(`--setting-sources user`).
+- **격리:** 에이전트는 지식 저장소를 보지 않는다. 실행마다 공통 패턴을 `~/Workspace/.qa-eval/p-<무작위>/`(mini-KB: `patterns/`, `INDEX.md`)에 복사하고 그 경로만 준다. 그 실행 동안 `QA_KB`도 이 복사본을 가리킨다. 사례의 `linked_patterns`와 `eval_links`로 그 사례를 가리키는 패턴은 숨긴다(leave-one-out). 숨긴 목록은 결과 파일에 적힌다.
+- **transcript 검사:** 전체 stream-json 기록을 `~/Workspace/.qa-eval/transcripts/`(로컬, 커밋 안 함)에 남기고, `qa-knowledge`·지식 저장소 경로·`evals/<project>`·사례 파일 이름·사례 ID·숨긴 패턴 ID가 나오면 결과를 **INVALID**로 표시하고 종료 코드 1. `qa eval list`는 유효·무효 실행을 따로 센다.
+- `--no-patterns`: 패턴 없이 돌리는 기준선(학습 효과 비교용).
 - `claude -p --agent qa-breaker`에 **범위(scope)만** 준다. 이슈 본문·번호·`expected_finding`은 프롬프트에 넣지 않는다. 도구는 Read·Grep·Glob만(읽기 전용).
 - 결과는 `evals/<project>/results/<case>-<시각>.md`. v0 채점은 기대(위치·증상)와 에이전트 출력을 나란히 두고 사람이 표시한다.
 - 레포 위치: `--repo`, `QA_REPO_<PROJECT>` 환경 변수, 또는 `projects/<project>/project.yaml`의 `repo_paths`.

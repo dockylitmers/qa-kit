@@ -135,6 +135,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("unknown finding", out)
 
+    def test_eval_stage_leave_one_out(self):
+        kb = self.kb
+        for pid in ("PAT-a", "PAT-b", "PAT-c"):
+            cli(kb, "pattern", "new", pid, "--title", pid)
+        c = kb / "patterns/PAT-c.md"
+        c.write_text(c.read_text().replace("eval_links: []", "eval_links: [demo-1]"))
+        case = {"id": "demo-1", "linked_patterns": ["PAT-a"]}
+        hidden = qa.eval_hidden_patterns(kb, case)
+        self.assertEqual(hidden, ["PAT-a", "PAT-c"])
+        stage = Path(self.tmp.name) / "stage"
+        shown = qa.stage_patterns(kb, stage, hidden)
+        self.assertEqual(shown, ["PAT-b"])
+        self.assertEqual(sorted(f.name for f in (stage / "patterns").iterdir()), ["PAT-b.md"])
+        self.assertNotIn("PAT-a", (stage / "INDEX.md").read_text())
+        needles = qa.eval_leak_needles(kb, kb / "evals/demo/demo-1.yaml", case, "demo", hidden)
+        for n in ("qa-knowledge", str(kb), "evals/demo", "demo-1.yaml", "PAT-a", "PAT-c"):
+            self.assertIn(n, needles)
+        self.assertNotIn("PAT-b", needles)
+
+    def test_stream_final_text(self):
+        stream = "\n".join([
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "draft"}]}}),
+            json.dumps({"type": "result", "result": "final answer"})])
+        self.assertEqual(qa.stream_final_text(stream), "final answer")
+        self.assertEqual(qa.stream_final_text(stream.rsplit("\n", 1)[0]), "draft")
+
     def test_eval_prompt_hides_answer(self):
         case = {"id": "c1", "issue": 1234, "scope": {"feature": "refund", "paths": ["a/b.ts"]},
                 "expected_finding": {"location": "SECRET_LOCATION", "symptom": "SECRET_SYMPTOM"},

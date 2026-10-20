@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -1260,10 +1261,11 @@ def cmd_eval(args):
                 continue
             res_dir = kb / "evals" / f.parent.name / "results"
             runs = sorted(res_dir.glob(f"{f.stem}-*.md")) if res_dir.is_dir() else []
+            bad = sum(1 for r in runs if re.search(r"(?im)^(> \*\*invalid|\*\*Run validity: INVALID)", r.read_text(encoding="utf-8")))
             kind = "fp-trap" if f.parent.name == "fp-traps" else f.parent.name
             fc = c.get("failure_class")
             print(f"{c.get('id', f.stem)}  {kind}  {','.join(fc) if isinstance(fc, list) else fc}  "
-                  f"d{c.get('difficulty', '?')}  runs:{len(runs)}")
+                  f"d{c.get('difficulty', '?')}  runs:{len(runs) - bad} valid, {bad} invalid")
         return 0
 
     if args.action != "run":
@@ -1282,9 +1284,9 @@ def cmd_eval(args):
 
     base = Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
     started = stamp()
-    # Case ids often carry the issue number and symptom; the agent sees its cwd, so use an opaque name.
-    opaque = hashlib.sha256(str(case["id"]).encode()).hexdigest()[:10]
-    work = base / f"{project}-{opaque}-{started}"
+    # Case ids carry the issue number and symptom and the agent sees its paths, so every folder is opaque.
+    run_token = secrets.token_hex(5)
+    work = base / f"w-{run_token}"
     work.mkdir(parents=True, exist_ok=False)
     # History-free snapshot: git archive + fresh git init, so future commits and issue numbers are invisible.
     arch = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
@@ -1299,36 +1301,63 @@ def cmd_eval(args):
     run(["git", "add", "-A"], cwd=work, check=True)
     run(["git", "commit", "-q", "--no-gpg-sign", "-m", "snapshot"], cwd=work, env=genv, check=True)
 
-    # Only patterns/ is readable; evals/ (which holds expected_finding) stays out of reach.
-    patterns_dir = None if args.no_patterns else kb / "patterns"
-    prompt = eval_prompt(case, patterns_dir)
+    # The agent never sees the knowledge repo: global patterns minus this case's own (leave-one-out)
+    # are copied into an opaque mini-KB, and QA_KB points there for the run.
+    hidden = eval_hidden_patterns(kb, case)
+    stage, shown = (None, [])
+    if not args.no_patterns:
+        stage = base / f"p-{secrets.token_hex(5)}"
+        shown = stage_patterns(kb, stage, hidden)
+    prompt = eval_prompt(case, stage / "patterns" if stage else None)
     # `skills:` preload only applies to spawned subagents, so pass the procedure explicitly.
     skill_dir = KIT_DIR / "skills" / "qa-run"
     cmd = ["claude", "-p", "--agent", "qa-breaker", "--permission-mode", "dontAsk",
-           "--tools", "Read,Grep,Glob", "--output-format", "text", "--no-session-persistence",
+           "--tools", "Read,Grep,Glob", "--output-format", "stream-json", "--verbose",
+           "--no-session-persistence",
            "--setting-sources", "user",  # snapshot's own project settings and hooks stay unloaded
+           "--settings", json.dumps({"env": {"QA_KB": str(stage) if stage else ""}}),
            "--append-system-prompt-file", str(skill_dir / "SKILL.md"), f"--add-dir={skill_dir}"]
-    if patterns_dir:
-        cmd.append(f"--add-dir={patterns_dir}")
+    if stage:
+        cmd.append(f"--add-dir={stage}")
     if args.model:
         cmd += ["--model", args.model]
     if args.max_budget:
         cmd += ["--max-budget-usd", str(args.max_budget)]
     cmd.append(prompt)
 
+    needles = eval_leak_needles(kb, cf, case, project, hidden)
+    in_prompt = [n for n in needles if n.lower() in (prompt + " ".join(cmd)).lower()]
+    if in_prompt:
+        die(f"refusing to run: prompt or command exposes {in_prompt}")
+
     if args.dry_run:
-        print(f"snapshot: {work}\ncommand: {' '.join(cmd[:-1])} <prompt>\n--- prompt ---\n{prompt}")
+        print(f"snapshot: {work}\npattern dir: {stage or 'off'} ({len(shown)} shown, hidden: {hidden or '-'})\n"
+              f"command: {' '.join(cmd[:-1])} <prompt>\n--- prompt ---\n{prompt}")
         return 0
 
     print(f"running qa-breaker on {case['id']} in {work} (timeout {args.timeout} min)…", file=sys.stderr)
+    child_env = {k: v for k, v in os.environ.items() if k != "QA_KB"}
+    child_env["QA_EVAL"] = "1"
     t0 = dt.datetime.now()
     try:
-        r = run(cmd, cwd=work, timeout=args.timeout * 60, env=dict(os.environ, QA_EVAL="1"))
-        out, err, code = r.stdout, r.stderr, r.returncode
+        r = run(cmd, cwd=work, timeout=args.timeout * 60, env=child_env)
+        stream, err, code = r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stream = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err, code = f"timed out after {args.timeout} min", 124
     secs = int((dt.datetime.now() - t0).total_seconds())
+
+    # Keep the transcript outside the knowledge repo (it holds client code) and scan all of it.
+    tdir = base / "transcripts"
+    tdir.mkdir(parents=True, exist_ok=True)
+    transcript = tdir / f"{project}-{run_token}.jsonl"
+    transcript.write_text(stream, encoding="utf-8")
+    out = stream_final_text(stream)
+    low = (stream + "\n" + (err or "")).lower()
+    leaks = [n for n in needles if n.lower() in low]
+    valid = not leaks and code == 0
+    status = "valid" if valid else "INVALID — " + (
+        f"transcript mentions {', '.join(repr(x) for x in leaks)}" if leaks else f"exit code {code}")
 
     ef = case.get("expected_finding")
     if isinstance(ef, dict):
@@ -1341,7 +1370,10 @@ def cmd_eval(args):
     res_dir = kb / "evals" / project / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
     res = res_dir / f"{case['id']}-{started}.md"
+    removed = " (removed after run)" if (not args.keep and valid) else ""
     res.write_text(f"""# Eval result: {case['id']}
+
+**Run validity: {status}**
 
 | | |
 |---|---|
@@ -1352,11 +1384,15 @@ def cmd_eval(args):
 | started | {started} |
 | duration | {secs}s |
 | exit code | {code} |
-| agent | qa-breaker (tools Read, Grep, Glob; dontAsk) |
-| pattern library | {'off (--no-patterns)' if args.no_patterns else 'on (patterns/ readable)'} |
+| agent | qa-breaker (tools Read, Grep, Glob; dontAsk; user settings only) |
 | model | {args.model or 'default'} |
 | host | {socket.gethostname().split('.')[0]} |
-| snapshot | `{work}` |
+| snapshot | `{work}`{removed} |
+| pattern dir | {f'`{stage}` (temporary copy, QA_KB pointed here){removed}' if stage else 'off (--no-patterns, QA_KB empty)'} |
+| patterns shown | {len(shown)} global patterns |
+| patterns hidden (leave-one-out) | {', '.join(hidden) or '-'} |
+| transcript | `{transcript}` (local only, not committed) |
+| transcript check | {'pass' if not leaks else 'FAIL'} — searched for: {', '.join(repr(n) for n in needles)} |
 
 ## Prompt given to the agent (scope only)
 
@@ -1382,9 +1418,63 @@ Verdict: `hit | partial | miss` — grader: — notes:
 {out.strip() or '(no output)'}
 """ + (f"\n## stderr\n\n```text\n{err.strip()[:4000]}\n```\n" if err and err.strip() else ""), encoding="utf-8")
     print(rel(kb, res))
-    if not args.keep and code == 0:
+    print(f"run validity: {status}", file=sys.stderr)
+    if removed:
         shutil.rmtree(work, ignore_errors=True)
-    return 0 if code == 0 else 1
+        if stage:
+            shutil.rmtree(stage, ignore_errors=True)
+    return 0 if valid else 1
+
+
+def eval_hidden_patterns(kb: Path, case: dict):
+    """Patterns derived from this case: its linked_patterns plus any pattern whose eval_links name it."""
+    hidden = set(case.get("linked_patterns") or [])
+    for p in load_patterns(kb):
+        if str(case.get("id")) in [str(x) for x in (p.meta.get("eval_links") or [])]:
+            hidden.add(p.id)
+    return sorted(hidden)
+
+
+def stage_patterns(kb: Path, stage: Path, hidden):
+    """Copy global patterns except `hidden` into stage/patterns with eval_links blanked, plus an INDEX.md."""
+    (stage / "patterns").mkdir(parents=True)
+    shown = []
+    for p in load_patterns(kb):
+        if p.path.parent != kb / "patterns" or p.id in hidden:
+            continue
+        text = re.sub(r"(?m)^eval_links:.*$", "eval_links: []", p.text, count=1)
+        (stage / "patterns" / p.path.name).write_text(text, encoding="utf-8")
+        shown.append(p.id)
+    copies = [load_pattern(f) for f in sorted((stage / "patterns").glob("*.md"))]
+    (stage / "INDEX.md").write_text(
+        "# Pattern index\n\n" + "\n".join(index_line(c, stage) for c in copies) + "\n", encoding="utf-8")
+    return shown
+
+
+def eval_leak_needles(kb: Path, cf: Path, case: dict, project: str, hidden):
+    """Strings whose appearance in a run means the agent could see the answer or the knowledge repo."""
+    needles = {"qa-knowledge", str(kb), str(kb.resolve()), f"evals/{project}", "fp-traps",
+               cf.name, str(case.get("id"))}
+    needles.update(hidden)
+    return sorted(n for n in needles if n)
+
+
+def stream_final_text(stream: str) -> str:
+    """Final answer from claude stream-json output (result event, else the last assistant text)."""
+    final, last_text = None, ""
+    for line in stream.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "result" and isinstance(ev.get("result"), str):
+            final = ev["result"]
+        elif ev.get("type") == "assistant":
+            parts = [c.get("text", "") for c in (ev.get("message") or {}).get("content", [])
+                     if isinstance(c, dict) and c.get("type") == "text"]
+            if any(parts):
+                last_text = "\n".join(parts)
+    return final if final is not None else last_text
 
 
 # --------------------------------------------------------------------------
