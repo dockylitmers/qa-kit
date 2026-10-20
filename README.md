@@ -101,7 +101,8 @@ qa eval list [--project <p>]
 qa eval run <case> [--repo <clone>] [--timeout 30] [--max-budget 5] [--keep] [--dry-run]
 ```
 
-- 사례의 `pre_fix_commit`을 `git archive`로 이력 없이 `~/Workspace/.qa-eval/<case>-<시각>/`에 풀고 `git init`(미래 커밋·이슈 번호가 보이지 않게).
+- 사례의 `pre_fix_commit`을 `git archive`로 이력 없이 `~/Workspace/.qa-eval/<project>-<사례 해시>-<시각>/`에 풀고 `git init`(미래 커밋·이슈 번호가 보이지 않게). 폴더 이름은 사례 ID 대신 해시를 쓴다(사례 ID에 이슈 번호·증상이 들어 있어 에이전트가 작업 폴더 이름으로 답을 볼 수 있음). 사례와 폴더의 대응은 결과 파일에 적힌다.
+- 스냅샷 안의 프로젝트 설정·훅은 읽지 않는다(`--setting-sources user`).
 - `claude -p --agent qa-breaker`에 **범위(scope)만** 준다. 이슈 본문·번호·`expected_finding`은 프롬프트에 넣지 않는다. 도구는 Read·Grep·Glob만(읽기 전용).
 - 결과는 `evals/<project>/results/<case>-<시각>.md`. v0 채점은 기대(위치·증상)와 에이전트 출력을 나란히 두고 사람이 표시한다.
 - 레포 위치: `--repo`, `QA_REPO_<PROJECT>` 환경 변수, 또는 `projects/<project>/project.yaml`의 `repo_paths`.

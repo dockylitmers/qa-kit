@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -963,7 +964,10 @@ def cmd_init(args):
             keep.touch()
     pyaml = pdir / "project.yaml"
     if not pyaml.exists():
-        repos = yaml_flow([args.repo]) if args.repo else "[]"
+        repo = os.path.abspath(os.path.expanduser(args.repo)) if args.repo else None
+        if repo and repo.startswith(str(HOME) + os.sep):
+            repo = "~" + repo[len(str(HOME)):]
+        repos = yaml_flow([repo]) if repo else "[]"
         pyaml.write_text(
             f"name: {proj}\n"
             f"created_at: {today()}\n"
@@ -1276,7 +1280,9 @@ def cmd_eval(args):
 
     base = Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
     started = stamp()
-    work = base / f"{case['id']}-{started}"
+    # Case ids often carry the issue number and symptom; the agent sees its cwd, so use an opaque name.
+    opaque = hashlib.sha256(str(case["id"]).encode()).hexdigest()[:10]
+    work = base / f"{project}-{opaque}-{started}"
     work.mkdir(parents=True, exist_ok=False)
     # History-free snapshot: git archive + fresh git init, so future commits and issue numbers are invisible.
     arch = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
@@ -1296,6 +1302,7 @@ def cmd_eval(args):
     skill_dir = KIT_DIR / "skills" / "qa-run"
     cmd = ["claude", "-p", "--agent", "qa-breaker", "--permission-mode", "dontAsk",
            "--tools", "Read,Grep,Glob", "--output-format", "text", "--no-session-persistence",
+           "--setting-sources", "user",  # snapshot's own project settings and hooks stay unloaded
            "--append-system-prompt-file", str(skill_dir / "SKILL.md"), f"--add-dir={skill_dir}"]
     if args.model:
         cmd += ["--model", args.model]
