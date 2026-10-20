@@ -1223,7 +1223,7 @@ def resolve_repo(kb: Path, project: str, arg=None) -> Path:
         f"or add repo_paths to projects/{project}/project.yaml")
 
 
-def eval_prompt(case: dict) -> str:
+def eval_prompt(case: dict, patterns_dir=None) -> str:
     """Build the run prompt from the scope ONLY (never issue text, numbers or expected_finding)."""
     sc = case.get("scope")
     feature = sc.get("feature") or sc.get("name") if isinstance(sc, dict) else None
@@ -1232,6 +1232,8 @@ def eval_prompt(case: dict) -> str:
         lines.append(f"Feature in scope: {feature}")
     lines.append("Start from these paths (follow calls outward as needed):")
     lines += [f"- {p}" for p in scope_paths(sc)]
+    if patterns_dir:
+        lines.append(f"Failure pattern library (read-only hints, one file per pattern): {patterns_dir}")
     lines += [
         "",
         "Rules for this run:",
@@ -1297,13 +1299,17 @@ def cmd_eval(args):
     run(["git", "add", "-A"], cwd=work, check=True)
     run(["git", "commit", "-q", "--no-gpg-sign", "-m", "snapshot"], cwd=work, env=genv, check=True)
 
-    prompt = eval_prompt(case)
+    # Only patterns/ is readable; evals/ (which holds expected_finding) stays out of reach.
+    patterns_dir = None if args.no_patterns else kb / "patterns"
+    prompt = eval_prompt(case, patterns_dir)
     # `skills:` preload only applies to spawned subagents, so pass the procedure explicitly.
     skill_dir = KIT_DIR / "skills" / "qa-run"
     cmd = ["claude", "-p", "--agent", "qa-breaker", "--permission-mode", "dontAsk",
            "--tools", "Read,Grep,Glob", "--output-format", "text", "--no-session-persistence",
            "--setting-sources", "user",  # snapshot's own project settings and hooks stay unloaded
            "--append-system-prompt-file", str(skill_dir / "SKILL.md"), f"--add-dir={skill_dir}"]
+    if patterns_dir:
+        cmd.append(f"--add-dir={patterns_dir}")
     if args.model:
         cmd += ["--model", args.model]
     if args.max_budget:
@@ -1347,6 +1353,7 @@ def cmd_eval(args):
 | duration | {secs}s |
 | exit code | {code} |
 | agent | qa-breaker (tools Read, Grep, Glob; dontAsk) |
+| pattern library | {'off (--no-patterns)' if args.no_patterns else 'on (patterns/ readable)'} |
 | model | {args.model or 'default'} |
 | host | {socket.gethostname().split('.')[0]} |
 | snapshot | `{work}` |
@@ -1477,6 +1484,7 @@ def main(argv=None):
     p.add_argument("--model")
     p.add_argument("--max-budget", type=float, help="USD cap passed to claude --max-budget-usd")
     p.add_argument("--keep", action="store_true", help="keep the snapshot folder after a successful run")
+    p.add_argument("--no-patterns", action="store_true", help="hide the pattern library (learning-lift baseline)")
     p.add_argument("--dry-run", action="store_true", help="prepare the snapshot and print the prompt only")
     p.set_defaults(fn=cmd_eval)
 
