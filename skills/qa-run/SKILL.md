@@ -17,11 +17,11 @@ argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id
 
 | 역할 | 단계 | 쓸 수 있는 곳 |
 |---|---|---|
-| 호출한 세션(대화형 `/qa-run`) | 0, 7 호출, 8, 9 | 실행 폴더, `qa` CLI(9단계만) |
+| 호출한 세션(대화형 `/qa-run`) | 0, 7 호출(1차·2차), 8, 9 | 실행 폴더, `qa` CLI(9단계만), 이슈 트래커 **읽기**(8단계) |
 | `qa-breaker` 서브에이전트 | 1–6 | 실행 폴더만 |
-| `qa-skeptic` 서브에이전트 | 7 | 읽기 + 테스트 실행 |
+| `qa-skeptic` 서브에이전트 | 7 (결함 하나당 한 번 호출) | 읽기 + 테스트 실행 |
 
-- 네가 **호출한 세션**이면: 0단계를 하고, 1–6단계를 `qa-breaker`에게 맡기고(범위 파일 경로와 실행 폴더를 넘긴다), 결함 후보를 `qa-skeptic`에게 넘긴 뒤, 8–9단계를 한다.
+- 네가 **호출한 세션**이면: 0단계를 하고, 1–6단계를 `qa-breaker`에게 맡기고(범위 파일 경로와 실행 폴더를 넘긴다), 결함 후보마다 `qa-skeptic`을 따로 불러 1차 반박을 받고, 보고 직전에 새 `qa-skeptic`으로 2차 반박을 다시 받은 뒤(7단계), 8–9단계를 한다.
 - 네가 **qa-breaker**이면: 1–6단계를 하고, 결함 후보 목록(5단계 형식 + 증거 위치)을 마지막 메시지로 돌려준다. 7단계 이후는 하지 않는다.
 - 평가 모드(프롬프트가 "evaluation mode"라고 하면): 읽기 전용, L0 증거까지, 파일을 쓰지 않고 마지막 메시지로만 답한다.
 
@@ -49,7 +49,7 @@ propagation.md  4 전파 그래프
 backlog.md      5 가설 순위
 evidence/       6 증명(테스트·로그·seed)
 sandbox/        6 버리는 레포 사본
-skeptic.md      7 반박 결과
+skeptic.md      7 반박 결과(1차·2차, 결함마다)
 report.md       8 결함 카드 + 반박된 가설
 ```
 
@@ -60,6 +60,7 @@ report.md       8 결함 카드 + 반박된 가설
 - 허용 환경: 로컬 / dev / 스테이징 중 무엇, 쓸 수 있는 테스트 계정·샌드박스 키의 **이름**(값은 쓰지 않음).
 - 실험마다: 영향 범위, 중단 조건, 되돌리는 법. 공유 환경을 깨뜨릴 수 있는 실험(서버 중단, DB 조작, 대량 요청)은 사람 승인 없이는 하지 않는다.
 - 심각도 정의(기본값: [references/severity.md](references/severity.md))와 판정자.
+- 실행 환경 점검: `qa doctor --offline --target <레포 경로>`. 레포가 요구하는 도구(node·bun·docker·python 등)가 없다는 경고와 그 영향 문장(예: "이 환경에서는 L4 장애 주입 불가")을 그대로 적고, 증명 계획을 그에 맞춘다. 경고는 실패가 아니다.
 - 지식: `$QA_KB/INDEX.md`, 관련 패턴 파일, `$QA_KB/projects/<project>/notes.md`. 읽은 패턴 ID를 적는다(9단계 `applied`에 쓴다).
 
 ## 1. 정찰
@@ -101,6 +102,11 @@ report.md       8 결함 카드 + 반박된 가설
 
 순위는 **심각도 먼저**(곱셈 점수 금지, 조회표는 [references/severity.md](references/severity.md)): 돈·보안·개인정보 > 데이터 무결성 > 가용성 > 화면. 같은 심각도 안에서 가능성 → 조용히 지나가는가(감지 안 됨이 위) → 증명 비용(싼 것이 위). 각 가설에 쓴 패턴 ID를 붙인다(없으면 out-of-pattern).
 
+가설마다 세 칸을 **반드시** 채운다(비우면 심각도를 매기지 않은 것으로 본다):
+- **환경 가정(선행 조건)**: 이 결함이 일어나려면 참이어야 하는 것. 예: 운영에 어떤 웹훅이 등록돼 있음, 앞선 전달이 모두 실패함, 실DB의 교착 희생자 선택 규칙. 확인한 것과 확인 못 한 것을 나눈다.
+- **현실 빈도**: 정상 운영에서 얼마나 자주(항상 / 특정 조건마다 / 드묾 / 수 밀리초 창). 창의 크기와 그 근거(시간 초과 값, 호출 순서)를 적는다.
+- **심각도 근거**: 영향 × 빈도 × 선행 조건으로 왜 이 등급인지 한 줄. "설정이 틀리면 모두 영향" 같은 증폭 주장은 앞 단계 검사가 같은 조건을 먼저 막지 않는지 확인한 뒤에만 쓴다.
+
 ## 6. 증명
 
 증거 등급과 도구: [references/evidence-levels.md](references/evidence-levels.md).
@@ -120,20 +126,42 @@ report.md       8 결함 카드 + 반박된 가설
 - 증거는 `evidence/<가설 번호>/`에: 테스트 파일, 실행 명령, 출력(실패 확인), seed.
 - 평가 모드에서는 L0까지만 한다.
 
-qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 한 줄 요약, 가설 문장, 심각도(제안), 증거 등급, 증거 위치, 쓴 패턴 ID, 반박될 수 있는 이유(스스로 생각한 것).
+qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 한 줄 요약, 가설 문장, 심각도(제안), **환경 가정·현실 빈도·심각도 근거**, 증거 등급, 증거 위치, 쓴 패턴 ID, 반박될 수 있는 이유(스스로 생각한 것).
 
-## 7. 반박 검증 (호출한 세션이 qa-skeptic 호출)
+## 7. 반박 검증 — 두 번, 결함마다 따로 (호출한 세션이 qa-skeptic 호출)
 
-- 결함 후보마다 `qa-skeptic`에게 넘긴다: 후보 문장, 증거 위치, 레포 경로, 명세 위치. **찾은 에이전트의 추론은 넘기지 않는다**(증거만).
-- skeptic 판정: `refuted`(이미 막는 코드 / 명세상 의도 / 재현 불가) · `stands` · `downgraded`(심각도 하향). 근거는 파일·줄 또는 실행 출력.
-- `stands`와 `downgraded`만 8단계로 간다. 증거가 L0뿐이고 skeptic이 "불확실"이면 결함이 아니라 **확인 요청 목록**으로 간다.
-- 결과를 `skeptic.md`에 남긴다.
+반박은 **항상 두 번** 한다. 첫 번째는 실행 중에, 두 번째는 보고 직전에 새 컨텍스트에서. 사실 오류(예: 앞 단계 검사가 이미 막는 증폭 주장)와 심각도 과대는 2차에서만 잡히는 경우가 많다.
+
+**공통 규칙**
+- `qa-skeptic`을 **결함 하나당 한 번** 부른다. 여러 건을 한 번에 넘기지 않는다(턴 한도에 걸려 뒤쪽 결함이 얕게 검증된다). 서로 독립이면 병렬로 불러도 된다.
+- 넘기는 것: 후보 문장, 증거 위치(파일·줄, 테스트 경로·실행 출력), 레포 경로(사본), 명세 위치, 환경 가정·현실 빈도·심각도 근거. **찾은 에이전트의 추론은 넘기지 않는다**(증거만).
+- 판정: `refuted`(이미 막는 코드 / 명세상 의도 / 재현 불가) · `stands` · `downgraded`(심각도 하향) · `uncertain`. 근거는 파일·줄 또는 실행 출력. 판정마다 **현실 빈도**와 **선행 조건(환경 가정)** 칸을 다시 채운다.
+
+**7a. 1차 반박(실행 중, 건별)** — 6단계에서 증명이 끝난 결함마다 바로 부른다. `refuted`는 반박된 가설로 보낸다. 트리거가 줄었거나 사실이 고쳐지면 결함 카드에 반영한다.
+
+**7b. 2차 반박(보고 직전, 새 컨텍스트, 건별)** — 1차를 통과한 결함마다 **새로** `qa-skeptic`을 부른다(1차 호출을 이어 쓰지 않는다). 1차 결과는 넘기지 않고, 고친 카드와 증거만 넘긴다. 8단계 보고서는 2차 결과를 기준으로 한다.
+
+- `stands`와 `downgraded`만 8단계로 간다. 증거가 L0뿐이고 skeptic이 `uncertain`이면 결함이 아니라 **확인 요청 목록**으로 간다.
+- `skeptic.md`에 결함마다 두 결과를 나란히 남긴다: `1차: 판정 · 심각도 · 이유 / 2차: 판정 · 심각도 · 이유 · 고친 사실`.
 
 ## 8. 보고
 
-`report.md`. 형식: [references/defect-card.md](references/defect-card.md). 순서:
-1. 결론: 확인된 결함 n건(심각도별), 위험 상위 흐름 커버리지(분석 완료/미완).
-2. 결함 카드(GitHub 이슈 초안, 영어): 증상 중심 요약, 최소 재현, 기대(명세 근거)·실제, 환경·커밋, 전파 경로(트리거 → 전파 → 영향), 심각도와 이유, 증거 등급과 증거, 원인 추정과 확인 방법, 회귀 테스트 제안. 한 카드에 결함 하나.
+`report.md`. 형식: [references/defect-card.md](references/defect-card.md).
+
+**먼저 기존 이슈·결정을 검색한다**(카드를 쓰기 전, 결함마다). 호출한 세션이 한다(읽기만).
+
+```sh
+qa issue search --project <p> <핵심어 2–4개>     # 트래커(닫힌 것 포함) + 기록된 won't-fix 판정·정책
+# 직접 할 때(GitHub): gh issue list -R <owner/repo> --state all --search "<핵심어>" --json number,title,state,stateReason
+```
+
+- 닫힌 이슈, 특히 **not planned로 닫힌 것**까지 본다. 프로젝트 지식(`projects/<p>/notes.md`의 won't-fix 정책)과 지난 실행의 `wont_fix` 판정도 함께 본다.
+- 같은 문제가 이미 있으면 새 이슈 초안을 쓰지 않는다. 카드에 **기존 결정 충돌**(`Existing decision: #<n> closed as not planned on <date>` 또는 열린 이슈 번호)로 표시하고, 필요하면 그 이슈에 붙일 코멘트 초안만 만든다. 관련 이슈는 카드의 `Related:` 줄에 적는다.
+- Jira 등 다른 트래커를 쓰는 프로젝트는 검색 명령을 `projects/<p>/project.yaml`의 `issue_tracker`에 둔다(README 참고). 설정이 없으면 보고서의 '확인 못 한 것'에 "기존 이슈 검색 안 함"으로 적는다.
+
+순서:
+1. 결론: 확인된 결함 n건(심각도별), 1차→2차 반박 집계(유지·하향·반박), 기존 결정 충돌 n건, 위험 상위 흐름 커버리지(분석 완료/미완).
+2. 결함 카드(GitHub 이슈 초안, 영어): 증상 중심 요약, 최소 재현, 기대(명세 근거)·실제, 환경·커밋, **환경 가정·현실 빈도**, 전파 경로(트리거 → 전파 → 영향), 심각도와 이유(1차 → 2차), 증거 등급과 증거, 두 반박 결과, 원인 추정과 확인 방법, 회귀 테스트 제안, Related. 한 카드에 결함 하나.
 3. 확인 요청 목록(가설 등급).
 4. 반박된 가설과 반박 근거(학습 재료).
 5. 확인 못 한 것(시간·환경·권한 때문에 못 본 곳).
@@ -150,10 +178,17 @@ qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 
 qa finding applied --project <p> --run <run-id> --patterns PAT-a,PAT-b     # 0단계에서 읽고 쓴 패턴
 qa finding add --project <p> --run <run-id> --title "<symptom summary>" \
   --severity high --evidence L1 --class error_propagation \
-  --location "<file>:<line>" --patterns PAT-a --summary "<one line>"       # 8단계 결함 카드마다
+  --location "<file>:<line>" --patterns PAT-a --summary "<one line>" \
+  --assumption "<environment assumption>" --frequency "<realistic frequency>" \
+  --severity-basis "<impact x frequency x preconditions>"                  # 8단계 결함 카드마다(처음 심각도)
+qa finding review --project <p> --run <run-id> --finding F001 --round 1 \
+  --verdict stands --severity high --reason "<one line>"                   # 7a 결과
+qa finding review --project <p> --run <run-id> --finding F001 --round 2 \
+  --verdict downgraded --severity medium --reason "<one line>" --corrections "<facts fixed>"   # 7b 결과
 ```
 
-- 판정(`qa finding judge`)은 사람이 정한 뒤에 기록한다: 채택·오탐·안 고침·중복 + 이유 + 확정 심각도.
+- 판정(`qa finding judge`)은 사람이 정한 뒤에 기록한다: 채택·오탐·안 고침·중복 + 이유 + 확정 심각도 + 게시된 이슈 번호(`--issue`)와 관련 이슈·결정(`--related`). 이슈 번호가 있어야 놓친 결함 수집(`qa misses collect`)이 이 실행이 낸 이슈를 뺀다.
+- 판정 뒤 결함마다 심각도 보정 한 줄: `qa calibration add --project <p> --run <run-id> --finding F001 --reason "<고객사 이름 없는 이유>" --tags <tag>`.
 - 패턴을 직접 고치지 않는다. 패턴 변경은 `/qa-retro`가 `proposals/`에 항목 단위로 제안한다.
 - 반박된 가설 중 같은 이유가 반복되는 것은 report.md에 "오탐 함정 후보"로 적어 둔다(회고 재료).
 - 끝나면 `qa check`로 형식을 확인한다. `qa sync`는 사람이 검토한 뒤 한다.

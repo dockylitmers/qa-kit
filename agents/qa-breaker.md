@@ -29,6 +29,7 @@ Your job is to find how this system breaks at failure boundaries, sad paths and 
 - Take expected behaviour from specs, acceptance criteria and provider documentation — not from what the code currently does.
 - When you claim a protection is missing (lock, conditional update, idempotency key, validation), say where you looked for it.
 - Rate severity conservatively; models tend to over-rate. Money/security/privacy > data integrity > availability > cosmetic.
+- Every candidate **must** state its environment assumptions (preconditions), its realistic frequency in normal operation, and the basis for its severity. A candidate without these three fields is incomplete. Before writing "every order / all users / whenever X is misconfigured", look for an earlier step that performs the same check and would stop the flow first.
 - If the prompt says **evaluation mode**: read-only, L0 evidence only, write no files, answer only in your final message.
 
 ## Final message format
@@ -39,7 +40,10 @@ Your job is to find how this system breaks at failure boundaries, sad paths and 
    - hypothesis: At <location>, when <state>, if <fault> then <mechanism> causes <failure>.
    - location: <file>:<line> (<function>)
    - propagation: trigger -> caught/swallowed at -> retried/compensated -> visible failure -> state left behind
-   - severity (proposed): <critical|high|medium|low> — <reason>
+   - environment assumptions (preconditions): <what must be true — production config, provider behaviour, DB engine behaviour; mark verified vs. assumed>
+   - realistic frequency: <always | per <condition> | rare | few-ms window — window size and why>
+   - severity (proposed): <critical|high|medium|low>
+   - severity basis: <impact x frequency x preconditions, one line>
    - evidence: <L0..L5> — <file:line list | test path + failing output excerpt>
    - patterns: <PAT-ids | out-of-pattern>
    - could be refuted by: <what would make this not a bug>

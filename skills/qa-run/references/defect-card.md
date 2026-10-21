@@ -8,7 +8,10 @@
 **Severity:** critical | high | medium | low — <one-line reason>
 **Evidence level:** L0 code | L1 failing test | L2 property | L3 fuzz | L4 fault injection | L5 mutation
 **Environment / version:** <branch or commit>, <local|dev|staging>, frequency <always|intermittent n/m>
+**Assumptions (preconditions):** <what must be true for this to happen — e.g. which webhook is registered in production; mark verified vs. assumed>
+**Realistic frequency:** <how often in normal operation and why — window size, timeouts, call order>
 **Patterns:** <PAT-ids or "out-of-pattern">
+**Related:** <#n existing issues> · **Existing decision:** <#n closed as not planned on YYYY-MM-DD, or "none found" + the search used>
 
 #### Steps to reproduce
 1. …
@@ -26,7 +29,8 @@ trigger → <where it is caught or swallowed> → <what retries or compensates> 
 #### Evidence
 - `<file>:<line>` — <what this line shows>
 - failing test: `<path in evidence bundle>`, command `<cmd>`, output excerpt
-- refutation attempted by skeptic: <what was checked and why it did not hold>
+- refutation round 1 (in run): <verdict, severity — what was checked and why it did not hold>
+- refutation round 2 (fresh context, before reporting): <verdict, severity — facts corrected>
 
 #### Suspected cause (inference) and how to confirm
 …
@@ -40,6 +44,8 @@ trigger → <where it is caught or swallowed> → <what retries or compensates> 
 - 좋음: "Duplicate approval webhook fulfils the order twice when the first delivery times out" — 증상, 조건, 결과가 제목에 있다.
 - 나쁨: "Webhook bug", "Possible race condition" — 무엇이 깨지는지 모른다.
 - 나쁨: 증거 없이 "could potentially lead to…"만 있는 카드 → 확인 요청 목록으로 보낸다.
+- 나쁨: "if the configuration is wrong, every order is affected" 같은 증폭 문장을, 앞 단계가 같은 검사를 먼저 해서 그 경우를 막는지 확인하지 않고 쓴 카드.
+- 기존 결정과 같은 문제(닫힌 not planned 이슈, 기록된 won't-fix)는 새 카드 대신 "기존 결정 충돌"로 표시하고 그 이슈용 코멘트 초안만 쓴다.
 
 ## 확인 요청 목록 항목
 
