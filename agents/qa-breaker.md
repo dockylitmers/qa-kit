@@ -31,6 +31,7 @@ Your job is to find how this system breaks at failure boundaries, sad paths and 
 - When you claim a protection is missing (lock, conditional update, idempotency key, validation), say where you looked for it.
 - Rate severity conservatively; models tend to over-rate. Money/security/privacy > data integrity > availability > cosmetic.
 - Every candidate **must** state its environment assumptions (preconditions), its realistic frequency in normal operation, and the basis for its severity. A candidate without these three fields is incomplete. Before writing "every order / all users / whenever X is misconfigured", look for an earlier step that performs the same check and would stop the flow first.
+- If the run folder has `coverage.md` (made by `qa coverage init`), fill every cell you looked at with `qa coverage set --file <run>/coverage.md --rows <ids> --axis <axis> --checked "<evidence ref>"`; use `--not-done "<reason>"` for hypotheses you raised but could not prove and `--out-of-scope "<reason>"` for what the scope excludes. Never mark a cell `checked` without evidence. Leave cells you did not reach blank for the calling session.
 - If the prompt says **evaluation mode**: read-only, L0 evidence only, write no files, answer only in your final message.
 
 ## Final message format

@@ -9,12 +9,15 @@ format checks, ledger writes, deterministic stats and eval plumbing.
   qa init <project>             create projects/<project>/ and evals/<project>/
   qa check                      validate patterns, eval cases, run ledgers, leaks
   qa pattern list|show|new|index
-  qa finding add|review|judge|applied|list
+  qa finding add|review|judge|applied|scope|list
   qa calibration add|list       severity calibration (finder -> refutations -> confirmed)
   qa proposal show|decide|apply item-level knowledge changes, applied deterministically
   qa issue search               existing issues and recorded won't-fix decisions
   qa misses collect             bug issues since a date that no kit run reported
   qa eval list|run|report|audit <case>
+  qa coverage init|set|check    entry points x check axes (+ invariants); blank cells fail the report
+  qa seed list|apply|run        plant known defects in throwaway copies; measure the miss rate
+  qa rederive                   blind re-run of a finished run (results and derived patterns hidden)
   qa sync                       pull/commit/push the knowledge repo
 """
 
@@ -35,7 +38,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 KIT_DIR = Path(__file__).resolve().parent.parent
 HOME = Path(os.path.expanduser("~"))
 KB_REMOTE_SLUG = "dockylitmers/qa-knowledge"
@@ -856,6 +859,11 @@ def check_ledger(kb: Path, lf: Path, errors, warnings=None, pattern_ids=None):
             for k in ("issue", "related"):
                 if k in ev and not (isinstance(ev[k], list) and all(isinstance(x, int) for x in ev[k])):
                     errors.append(f"{where}:{n}: judgment.{k} must be a list of issue numbers")
+        elif t == "scope":
+            if not COMMIT_RE.match(str(ev.get("commit", ""))):
+                errors.append(f"{where}:{n}: scope.commit must be a commit hash")
+            if not isinstance(ev.get("paths"), list) or not ev.get("paths"):
+                errors.append(f"{where}:{n}: scope.paths must be a non-empty list")
         elif t == "attribution":
             if ev.get("finding") not in seen:
                 errors.append(f"{where}:{n}: attribution for unknown finding {ev.get('finding')}")
@@ -1360,6 +1368,17 @@ def cmd_finding(args):
         unknown = sorted(set(patterns) - known_pattern_ids(kb))
         if unknown:
             die(f"unknown pattern ids: {', '.join(unknown)}")
+
+    if args.action == "scope":
+        paths = split_list(args.paths)
+        if not (args.commit and COMMIT_RE.match(args.commit)) or not paths:
+            die("finding scope needs --commit <hash> and --paths a,b (repo-relative scope paths)")
+        lf = ledger_path(kb, args.project, args.run, create=True)
+        ev = {"type": "scope", "commit": args.commit, "paths": paths, "feature": args.feature,
+              "mode": args.mode, "coverage": args.coverage, "at": now_iso()}
+        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
+        print(f"scope recorded for {args.run}: {args.commit} {', '.join(paths)}")
+        return 0
 
     if args.action == "applied":
         lf = ledger_path(kb, args.project, args.run, create=True)
@@ -2096,11 +2115,16 @@ def eval_prompt(case: dict, patterns_dir=None) -> str:
     """Build the run prompt from the scope ONLY (never issue text, numbers or expected_finding)."""
     sc = case.get("scope")
     feature = sc.get("feature") or sc.get("name") if isinstance(sc, dict) else None
+    return headless_prompt(scope_paths(sc), patterns_dir, feature)
+
+
+def headless_prompt(paths, patterns_dir=None, feature=None, located=False) -> str:
+    """Scope-only prompt for headless runs; `located` asks for machine-gradable Location: lines."""
     lines = ["Failure-focused QA run on this repository snapshot (evaluation mode)."]
     if feature:
         lines.append(f"Feature in scope: {feature}")
     lines.append("Start from these paths (follow calls outward as needed):")
-    lines += [f"- {p}" for p in scope_paths(sc)]
+    lines += [f"- {p}" for p in paths]
     if patterns_dir:
         lines.append(f"Failure pattern library (read-only hints, one file per pattern): {patterns_dir}")
     lines += [
@@ -2114,6 +2138,9 @@ def eval_prompt(case: dict, patterns_dir=None) -> str:
         "function), trigger -> propagation -> visible failure, severity, evidence (file:line), and what "
         "would refute it.",
     ]
+    if located:
+        lines.append("- Give each candidate's location on its own line as `Location: <path>:<line>` "
+                     "(path relative to the repository root).")
     return "\n".join(lines)
 
 
@@ -2169,19 +2196,22 @@ def cmd_eval(args):
     return 0 if all(c == 0 for c in codes) else 1
 
 
-def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
-    base = Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
-    started = stamp()
-    # Case ids carry the issue number and symptom and the agent sees its paths, so every folder is opaque.
-    run_token = secrets.token_hex(5)
-    work = base / f"w-{run_token}"
+def eval_base() -> Path:
+    return Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
+
+
+def make_snapshot(repo: Path, commit: str, work: Path, mutate=None):
+    """History-free copy of repo@commit (git archive + fresh git init, one commit), so future commits
+    and issue numbers are invisible. `mutate(work)` runs before that commit: planted changes do not
+    show up in `git diff` or the history."""
     work.mkdir(parents=True, exist_ok=False)
-    # History-free snapshot: git archive + fresh git init, so future commits and issue numbers are invisible.
     arch = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
     tar = subprocess.run(["tar", "-x", "-C", str(work)], stdin=arch.stdout)
     arch.stdout.close()
     if arch.wait() != 0 or tar.returncode != 0:
         die("git archive failed")
+    if mutate:
+        mutate(work)
     genv = dict(os.environ, GIT_AUTHOR_NAME="qa-eval", GIT_AUTHOR_EMAIL="qa-eval@localhost",
                 GIT_COMMITTER_NAME="qa-eval", GIT_COMMITTER_EMAIL="qa-eval@localhost",
                 GIT_AUTHOR_DATE="2000-01-01T00:00:00Z", GIT_COMMITTER_DATE="2000-01-01T00:00:00Z")
@@ -2189,14 +2219,8 @@ def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
     run(["git", "add", "-A"], cwd=work, check=True)
     run(["git", "commit", "-q", "--no-gpg-sign", "-m", "snapshot"], cwd=work, env=genv, check=True)
 
-    # The agent never sees the knowledge repo: global patterns minus this case's own (leave-one-out)
-    # are copied into an opaque mini-KB, and QA_KB points there for the run.
-    hidden = eval_hidden_patterns(kb, case)
-    stage, shown = (None, [])
-    if not args.no_patterns:
-        stage = base / f"p-{secrets.token_hex(5)}"
-        shown = stage_patterns(kb, stage, hidden)
-    prompt = eval_prompt(case, stage / "patterns" if stage else None)
+
+def headless_cmd(stage, prompt, model=None, max_budget=None):
     # `skills:` preload only applies to spawned subagents, so pass the procedure explicitly.
     skill_dir = KIT_DIR / "skills" / "qa-run"
     cmd = ["claude", "-p", "--agent", "qa-breaker", "--permission-mode", "dontAsk",
@@ -2207,16 +2231,66 @@ def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
            "--append-system-prompt-file", str(skill_dir / "SKILL.md"), f"--add-dir={skill_dir}"]
     if stage:
         cmd.append(f"--add-dir={stage}")
-    if args.model:
-        cmd += ["--model", args.model]
-    if args.max_budget:
-        cmd += ["--max-budget-usd", str(args.max_budget)]
+    if model:
+        cmd += ["--model", model]
+    if max_budget:
+        cmd += ["--max-budget-usd", str(max_budget)]
     cmd.append(prompt)
+    return cmd
 
-    needles = eval_leak_needles(kb, cf, case, project, hidden)
-    in_prompt = [n for n in needles if n.lower() in (prompt + " ".join(cmd)).lower()]
+
+def refuse_exposed(cmd, needles):
+    in_prompt = [n for n in needles if n.lower() in " ".join(cmd).lower()]
     if in_prompt:
         die(f"refusing to run: prompt or command exposes {in_prompt}")
+
+
+def headless_run(cmd, work: Path, timeout_min: int, needles, transcript: Path):
+    """Run claude -p in the snapshot; keep the transcript outside the knowledge repo (it holds client
+    code) and scan all of it for the needles. Returns (final text, stderr, exit code, secs, leaks)."""
+    child_env = {k: v for k, v in os.environ.items() if k != "QA_KB"}
+    child_env["QA_EVAL"] = "1"
+    t0 = dt.datetime.now()
+    try:
+        r = run(cmd, cwd=work, timeout=timeout_min * 60, env=child_env)
+        stream, err, code = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        stream = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err, code = f"timed out after {timeout_min} min", 124
+    secs = int((dt.datetime.now() - t0).total_seconds())
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(stream, encoding="utf-8")
+    low = (stream + "\n" + (err or "")).lower()
+    leaks = [n for n in needles if n.lower() in low]
+    return stream_final_text(stream), err, code, secs, leaks
+
+
+def validity_status(leaks, code) -> str:
+    if not leaks and code == 0:
+        return "valid"
+    return "INVALID — " + (f"transcript mentions {', '.join(repr(x) for x in leaks)}" if leaks
+                           else f"exit code {code}")
+
+
+def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
+    base = eval_base()
+    started = stamp()
+    # Case ids carry the issue number and symptom and the agent sees its paths, so every folder is opaque.
+    run_token = secrets.token_hex(5)
+    work = base / f"w-{run_token}"
+    make_snapshot(repo, commit, work)
+
+    # The agent never sees the knowledge repo: global patterns minus this case's own (leave-one-out)
+    # are copied into an opaque mini-KB, and QA_KB points there for the run.
+    hidden = eval_hidden_patterns(kb, case)
+    stage, shown = (None, [])
+    if not args.no_patterns:
+        stage = base / f"p-{secrets.token_hex(5)}"
+        shown = stage_patterns(kb, stage, hidden)
+    prompt = eval_prompt(case, stage / "patterns" if stage else None)
+    cmd = headless_cmd(stage, prompt, args.model, args.max_budget)
+    needles = eval_leak_needles(kb, cf, case, project, hidden)
+    refuse_exposed(cmd, needles)
 
     if args.dry_run:
         print(f"snapshot: {work}\npattern dir: {stage or 'off'} ({len(shown)} shown, hidden: {hidden or '-'})\n"
@@ -2224,28 +2298,10 @@ def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
         return 0
 
     print(f"running qa-breaker on {case['id']} in {work} (timeout {args.timeout} min)…", file=sys.stderr)
-    child_env = {k: v for k, v in os.environ.items() if k != "QA_KB"}
-    child_env["QA_EVAL"] = "1"
-    t0 = dt.datetime.now()
-    try:
-        r = run(cmd, cwd=work, timeout=args.timeout * 60, env=child_env)
-        stream, err, code = r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired as e:
-        stream = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err, code = f"timed out after {args.timeout} min", 124
-    secs = int((dt.datetime.now() - t0).total_seconds())
-
-    # Keep the transcript outside the knowledge repo (it holds client code) and scan all of it.
-    tdir = base / "transcripts"
-    tdir.mkdir(parents=True, exist_ok=True)
-    transcript = tdir / f"{project}-{run_token}.jsonl"
-    transcript.write_text(stream, encoding="utf-8")
-    out = stream_final_text(stream)
-    low = (stream + "\n" + (err or "")).lower()
-    leaks = [n for n in needles if n.lower() in low]
+    transcript = base / "transcripts" / f"{project}-{run_token}.jsonl"
+    out, err, code, secs, leaks = headless_run(cmd, work, args.timeout, needles, transcript)
     valid = not leaks and code == 0
-    status = "valid" if valid else "INVALID — " + (
-        f"transcript mentions {', '.join(repr(x) for x in leaks)}" if leaks else f"exit code {code}")
+    status = validity_status(leaks, code)
 
     ef = case.get("expected_finding")
     if isinstance(ef, dict):
@@ -2454,6 +2510,8 @@ def stage_patterns(kb: Path, stage: Path, hidden):
         if p.path.parent != kb / "patterns" or p.id in hidden:
             continue
         text = re.sub(r"(?m)^eval_links:.*$", "eval_links: []", p.text, count=1)
+        for h in hidden:  # a shown pattern that names a hidden one must not point at it
+            text = text.replace(h, "PAT-hidden")
         (stage / "patterns" / p.path.name).write_text(text, encoding="utf-8")
         shown.append(p.id)
     copies = [load_pattern(f) for f in sorted((stage / "patterns").glob("*.md"))]
@@ -2486,6 +2544,1371 @@ def stream_final_text(stream: str) -> str:
             if any(parts):
                 last_text = "\n".join(parts)
     return final if final is not None else last_text
+
+
+# --------------------------------------------------------------------------
+# Source scanning (entry points, seed sites) — TypeScript/JavaScript, read-only
+# --------------------------------------------------------------------------
+
+SOURCE_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+SPECIAL_RE = re.compile(r"//|/\*|['\"`]")
+# Control words that look like `name(`; a class method may still be called `export` or `delete`.
+KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "function", "constructor", "super", "await",
+            "typeof", "new", "throw", "else", "do", "try", "with", "yield"}
+
+
+def mask_source(text: str) -> str:
+    """Blank comments and string contents (quotes, length and newlines kept) so brackets can be counted."""
+    out = list(text)
+    i, n = 0, len(text)
+    while True:
+        m = SPECIAL_RE.search(text, i)
+        if not m:
+            break
+        i = m.start()
+        tok = m.group(0)
+        if tok == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            lo, hi = i, j
+        elif tok == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            lo, hi = i, j
+        else:
+            j = i + 1
+            while j < n and text[j] != tok:
+                if text[j] == "\\":
+                    j += 1
+                elif tok != "`" and text[j] == "\n":
+                    break
+                j += 1
+            lo, hi = i + 1, min(j, n)
+            j += 1
+        for k in range(lo, hi):
+            if text[k] != "\n":
+                out[k] = " "
+        i = j
+    return "".join(out)
+
+
+def match_bracket(masked: str, open_i: int) -> int:
+    """Index of the bracket closing masked[open_i] ('(', '{' or '['); len(masked) if unbalanced."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    opener = masked[open_i]
+    closer = pairs[opener]
+    depth = 0
+    for k in range(open_i, len(masked)):
+        c = masked[k]
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(masked)
+
+
+class SourceFile:
+    def __init__(self, root: Path, rel_path: str):
+        self.rel = rel_path
+        self.text = (root / rel_path).read_text(encoding="utf-8", errors="replace")
+        self.masked = mask_source(self.text)
+        self._starts = [0] + [m.end() for m in re.finditer(r"\n", self.text)]
+
+    def line(self, idx: int) -> int:
+        lo, hi = 0, len(self._starts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._starts[mid] <= idx:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def whole_lines(self, start: int, end: int):
+        """Widen [start, end) to whole lines when nothing else shares them."""
+        ls = self.text.rfind("\n", 0, start) + 1
+        le = self.text.find("\n", end)
+        le = len(self.text) if le < 0 else le
+        if self.text[ls:start].strip() == "" and self.text[end:le].strip() == "":
+            return ls, min(le + 1, len(self.text))
+        return start, end
+
+
+def source_files(repo: Path, scope):
+    """Repo-relative source files under the scope paths (tests, type declarations and vendored dirs skipped)."""
+    out = []
+    for sp in scope:
+        base = (repo / sp)
+        if base.is_file():
+            cands = [base]
+        elif base.is_dir():
+            cands = []
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = [d for d in dirnames if d not in TARGET_SKIP_DIRS and d != "__tests__"]
+                cands += [Path(dirpath) / f for f in filenames]
+        else:
+            die(f"scope path not found in repo: {sp}")
+        for f in cands:
+            name = f.name
+            if f.suffix not in SOURCE_EXTS or name.endswith(".d.ts") or re.search(r"\.(spec|test|e2e-spec)\.", name):
+                continue
+            out.append(str(f.relative_to(repo)))
+    return sorted(set(out))
+
+
+def repo_source_files(repo: Path):
+    if (repo / ".git").exists():
+        r = run(["git", "-C", str(repo), "ls-files"])
+        if r.returncode == 0:
+            return [f for f in r.stdout.splitlines() if Path(f).suffix in SOURCE_EXTS and not f.endswith(".d.ts")]
+    return source_files(repo, ["."])
+
+
+def normalize_scope(repo: Path, scope):
+    out = []
+    for s in scope:
+        p = Path(os.path.expanduser(s))
+        if p.is_absolute():
+            try:
+                p = p.resolve().relative_to(repo.resolve())
+            except ValueError:
+                die(f"scope path is outside the repo: {s}")
+        out.append(str(p).rstrip("/") or ".")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Entry-point extraction (NestJS controllers, jobs, listeners, queue consumers; Next.js routes/actions)
+# --------------------------------------------------------------------------
+
+HTTP_DECORATORS = {"Get": "GET", "Post": "POST", "Put": "PUT", "Patch": "PATCH", "Delete": "DELETE",
+                   "Head": "HEAD", "Options": "OPTIONS", "All": "ALL"}
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE", "ALL", "ANY", "ACTION"}
+SCHEDULE_DECORATORS = {"Cron", "Interval", "Timeout"}
+EVENT_DECORATORS = {"OnEvent"}
+QUEUE_DECORATORS = {"Process", "EventPattern", "MessagePattern", "SqsMessageHandler", "RabbitSubscribe",
+                    "RabbitRPC", "SqsConsumerEventHandler"}
+PUBLIC_DECORATORS = {"Public", "AllowAnonymous", "SkipAuth", "IsPublic", "NoAuth", "Anonymous"}
+AUTH_DECORATOR_RE = re.compile(r"Permission|Role|Scope|Polic|Abilit|Auth|Guard|Admin|Staff|Owner|Acl|Rbac", re.I)
+WEBHOOK_RE = re.compile(r"webhook|callback|notif(y|ication)-?hook|/hooks?\b|\bipn\b", re.I)
+NEST_TOKEN_RE = re.compile(
+    r"@([A-Za-z_$][\w$]*)\s*\("
+    r"|\bclass\s+([A-Za-z_$][\w$]*)"
+    r"|^[ \t]*(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+)*([A-Za-z_$][\w$]*)\s*"
+    r"(?:<[^>()\n]*>)?\s*\("
+    r"|([();])", re.M)
+TIMER_RE = re.compile(r"\b(setInterval|cron\.schedule|schedule\.scheduleJob|new\s+CronJob)\s*\(")
+CONST_RE = re.compile(r"\bconst\s+([A-Za-z_$][\w$]*)\s*(?::\s*[\w$<>\[\]]+\s*)?=\s*(['\"`])([^'\"`\n$]*)\2")
+NEXT_ROUTE_RE = re.compile(r"(?:^|/)app/(.*?)/?route\.(?:ts|js|tsx|jsx|mjs)$")
+NEXT_PAGES_API_RE = re.compile(r"(?:^|/)pages/(api/.*)\.(?:ts|js|tsx|jsx)$")
+NEXT_METHOD_RE = re.compile(r"export\s+(?:async\s+)?(?:function\s+|const\s+)(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b")
+NEXT_REEXPORT_RE = re.compile(r"export\s*\{([^}]*)\}")
+SESSION_CALL_RE = re.compile(r"\b(getServerSession|auth|currentUser|requireAuth|withAuth|getSession|requireUser)\s*\(")
+
+
+class Deco:
+    def __init__(self, name, args, line, start, end):
+        self.name, self.args, self.line, self.start, self.end = name, args, line, start, end
+
+    def short(self):
+        a = re.sub(r"\s+", "", self.args).replace("'", "").replace('"', "")
+        return f"{self.name}({a[:60]})"
+
+
+def scan_ts_members(sf: SourceFile):
+    """Classes and decorated methods of one file: [(cls_name, cls_decos, method, decos, line)]."""
+    text, masked = sf.text, sf.masked
+    pos, depth = 0, 0
+    pending, cls, cls_decos = [], None, []
+    out = []
+    while True:
+        m = NEST_TOKEN_RE.search(masked, pos)
+        if not m:
+            break
+        if m.group(1) is not None:
+            open_i = m.end() - 1
+            close_i = match_bracket(masked, open_i)
+            if depth == 0:
+                pending.append(Deco(m.group(1), text[open_i + 1:close_i].strip(), sf.line(m.start()),
+                                    m.start(), close_i + 1))
+            pos = close_i + 1
+        elif m.group(2) is not None:
+            if depth == 0:
+                cls, cls_decos, pending = m.group(2), pending, []
+            pos = m.end()
+        elif m.group(3) is not None:
+            name = m.group(3)
+            open_i = m.end() - 1
+            close_i = match_bracket(masked, open_i)
+            if depth == 0 and name not in KEYWORDS:
+                processor = any(d.name == "Processor" for d in cls_decos)
+                if pending or (processor and name == "process"):
+                    out.append((cls, cls_decos, name, pending, sf.line(m.start(3))))
+                pending = []
+            pos = close_i + 1
+        else:
+            c = m.group(4)
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                pending = []
+            pos = m.end()
+    return out
+
+
+def first_string(args: str):
+    m = re.match(r"\s*(['\"`])([^'\"`]*)\1", args)
+    return m.group(2) if m else None
+
+
+class ConstIndex:
+    """Lazy repo-wide `const NAME = '...'` lookup for routes given as constants."""
+
+    def __init__(self, repo: Path):
+        self.repo, self.map = repo, None
+
+    def get(self, name):
+        if self.map is None:
+            self.map = {}
+            for f in repo_source_files(self.repo):
+                try:
+                    t = (self.repo / f).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for m in CONST_RE.finditer(t):
+                    self.map.setdefault(m.group(1), set()).add(m.group(3))
+        vals = self.map.get(name) or set()
+        return next(iter(vals)) if len(vals) == 1 else None
+
+
+def route_args(args: str, consts: ConstIndex):
+    """Route paths named by a decorator argument; (paths, unresolved_expr)."""
+    a = args.strip()
+    if not a:
+        return [""], None
+    s = first_string(a)
+    if s is not None and "${" not in s:
+        return [s], None
+    if a.startswith("["):
+        vals = re.findall(r"(['\"])([^'\"]*)\1", a)
+        return ([v for _, v in vals] or [""]), (None if vals else a)
+    if a.startswith("{"):
+        m = re.search(r"\bpath\s*:\s*(['\"])([^'\"]*)\1", a)
+        if m:
+            return [m.group(2)], None
+        m = re.search(r"\bpath\s*:\s*([A-Za-z_$][\w$.]*)", a)
+        if not m:
+            return [""], None
+        a = m.group(1)
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", a):
+        v = consts.get(a)
+        if v is not None:
+            return [v], None
+    return [f"<dynamic:{a[:40]}>"], a
+
+
+def join_route(*parts):
+    segs = [p.strip("/") for p in parts if p and p.strip("/")]
+    return "/" + "/".join(segs)
+
+
+def auth_marks(decos):
+    marks = []
+    for d in decos:
+        if d.name in PUBLIC_DECORATORS:
+            marks.append("public")
+        elif not d.name.startswith("Api") and AUTH_DECORATOR_RE.search(d.name):
+            marks.append(d.short())
+    return marks
+
+
+def extract_entry_points(repo: Path, scope):
+    """Mechanical entry-point list for the scope. Returns (rows, notes)."""
+    consts = ConstIndex(repo)
+    rows, notes = [], []
+    for rel_path in source_files(repo, scope):
+        try:
+            sf = SourceFile(repo, rel_path)
+        except OSError:
+            continue
+        loc = lambda line: f"{rel_path}:{line}"  # noqa: E731
+        # NestJS-style decorated classes
+        if "@" in sf.masked:
+            for cls, cdecos, meth, mdecos, line in scan_ts_members(sf):
+                ctrl = next((d for d in cdecos if d.name == "Controller"), None)
+                names = {d.name for d in mdecos}
+                http = [d for d in mdecos if d.name in HTTP_DECORATORS]
+                if ctrl and http:
+                    prefixes, bad_p = route_args(ctrl.args, consts)
+                    marks = auth_marks(cdecos) + auth_marks(mdecos)
+                    for d in http:
+                        paths, bad = route_args(d.args, consts)
+                        for bad_expr in (bad_p, bad):
+                            if bad_expr:
+                                notes.append(f"dynamic route at {loc(d.line)}: {bad_expr} — fill the route by hand")
+                        for pre in prefixes:
+                            for p in paths:
+                                route = join_route(pre, p)
+                                kind = "webhook" if WEBHOOK_RE.search(f"{route} {meth}") else "http"
+                                rows.append({"kind": kind, "method": HTTP_DECORATORS[d.name], "route": route,
+                                             "auth": ", ".join(dict.fromkeys(marks)) or "-",
+                                             "location": loc(line), "handler": f"{cls}.{meth}"})
+                    continue
+                for group, kind in ((SCHEDULE_DECORATORS, "schedule"), (EVENT_DECORATORS, "event"),
+                                    (QUEUE_DECORATORS, "queue")):
+                    hit = [d for d in mdecos if d.name in group]
+                    if hit:
+                        d = hit[0]
+                        label = first_string(d.args) or re.sub(r"\s+", "", d.args)[:40]
+                        rows.append({"kind": kind, "method": d.name.upper(),
+                                     "route": f"{cls}.{meth}" + (f" [{label}]" if label else ""),
+                                     "auth": "-", "location": loc(line), "handler": f"{cls}.{meth}"})
+                        break
+                else:
+                    if meth == "process" and not names and any(d.name == "Processor" for d in cdecos):
+                        pd = next(d for d in cdecos if d.name == "Processor")
+                        label = first_string(pd.args) or ""
+                        rows.append({"kind": "queue", "method": "PROCESS",
+                                     "route": f"{cls}.process" + (f" [{label}]" if label else ""),
+                                     "auth": "-", "location": loc(line), "handler": f"{cls}.process"})
+        # timers started in code (setInterval, cron libraries)
+        for m in TIMER_RE.finditer(sf.masked):
+            open_i = m.end() - 1
+            args = sf.text[open_i + 1:match_bracket(sf.masked, open_i)]
+            target = re.search(r"this\.([\w$]+)\s*\(", args) or re.search(r"([A-Za-z_$][\w$]*)\s*\(", args)
+            owner = None
+            for cm in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)", sf.masked[:m.start()]):
+                owner = cm.group(1)
+            name = f"{owner + '.' if owner else ''}{target.group(1) if target else '?'}"
+            rows.append({"kind": "schedule", "method": "TIMER", "route": f"{name} [{m.group(1).split()[-1]}]",
+                         "auth": "-", "location": loc(sf.line(m.start())), "handler": name})
+        # Next.js route handlers, pages/api routes and server actions
+        nm = NEXT_ROUTE_RE.search(rel_path)
+        pm = NEXT_PAGES_API_RE.search(rel_path)
+        session = "session" if SESSION_CALL_RE.search(sf.masked) else "-"
+        if nm:
+            segs = [s for s in nm.group(1).split("/") if s and not (s.startswith("(") and s.endswith(")"))
+                    and not s.startswith("@")]
+            methods = {}
+            for mm in NEXT_METHOD_RE.finditer(sf.masked):
+                methods.setdefault(mm.group(1), sf.line(mm.start()))
+            for em in NEXT_REEXPORT_RE.finditer(sf.masked):
+                for mm in re.finditer(r"(?:\bas\s+|^\s*)(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*$|"
+                                      r"\bas\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b", em.group(1), re.M):
+                    methods.setdefault(mm.group(1) or mm.group(2), sf.line(em.start()))
+            route = join_route(*segs)
+            for meth, line in methods.items():
+                rows.append({"kind": "webhook" if WEBHOOK_RE.search(route) else "http", "method": meth,
+                             "route": route, "auth": session, "location": loc(line), "handler": "route"})
+        elif pm:
+            route = join_route(re.sub(r"/index$", "", pm.group(1)))
+            rows.append({"kind": "webhook" if WEBHOOK_RE.search(route) else "http", "method": "ANY",
+                         "route": route, "auth": session, "location": loc(1), "handler": "handler"})
+        if re.match(r"(['\"])use server\1", sf.text.lstrip()):
+            for am in re.finditer(r"export\s+(?:async\s+function\s+|const\s+)([A-Za-z_$][\w$]*)", sf.masked):
+                rows.append({"kind": "action", "method": "ACTION", "route": f"{rel_path}#{am.group(1)}",
+                             "auth": session, "location": loc(sf.line(am.start())), "handler": am.group(1)})
+    order = {"http": 0, "webhook": 1, "action": 2, "schedule": 3, "event": 4, "queue": 5}
+    rows.sort(key=lambda r: (order.get(r["kind"], 9), r["route"], r["method"]))
+    seen, uniq = set(), []
+    for r in rows:
+        k = row_key(r)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    return uniq, notes
+
+
+def repo_globals(repo: Path):
+    """App-wide guards and route prefix, for the table header (they apply to rows marked '-')."""
+    guards, prefix = [], None
+    for f in repo_source_files(repo):
+        if "node_modules" in f:
+            continue
+        try:
+            t = (repo / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "APP_GUARD" in t:
+            guards += re.findall(r"provide\s*:\s*APP_GUARD\s*,\s*useClass\s*:\s*([\w$]+)", t)
+        if "useGlobalGuards" in t:
+            guards += re.findall(r"new\s+([\w$]+)\s*\(", " ".join(re.findall(r"useGlobalGuards\(([^;]*)\)", t)))
+        if prefix is None and "setGlobalPrefix" in t:
+            m = re.search(r"setGlobalPrefix\(\s*(['\"])([^'\"]+)\1", t)
+            prefix = m.group(2) if m else None
+    return list(dict.fromkeys(guards)), prefix
+
+
+# --------------------------------------------------------------------------
+# qa coverage — the denominator: entry points x check axes, plus the run's invariants
+# --------------------------------------------------------------------------
+
+COVERAGE_AXES = ["authz", "dup", "conc", "abort", "input", "audit"]
+COVERAGE_AXIS_HELP = {
+    "authz": "authorization and object ownership",
+    "dup": "retry, double submit, idempotency",
+    "conc": "races, locks, several tabs or instances",
+    "abort": "partial failure, external failure, timeout, shutdown",
+    "input": "boundaries and formats",
+    "audit": "audit records and logs",
+}
+COVERAGE_STATES = ["checked", "out_of_scope", "not_done"]
+COVERAGE_CELL_RE = re.compile(r"^(checked|out_of_scope|not_done):\s*(\S.*)$")
+ENTRY_COLS = ["id", "kind", "method", "route", "auth", "location"] + COVERAGE_AXES
+INV_COLS = ["id", "invariant", "source", "check"]
+INVARIANT_LINE_RE = re.compile(r"^\s*[-*]\s*\**(I\d+)\**\s*[:：.)]\s*(.+?)\s*$")
+READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def row_key(r) -> str:
+    return f"{r['kind']} {r['method']} {r['route']}"
+
+
+def split_md_row(line: str):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def parse_invariants(path: Path):
+    """`- I1: text` lines (design card format); without them, bullets under an invariants heading."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out = [(m.group(1), m.group(2), n) for n, l in enumerate(lines, 1) if (m := INVARIANT_LINE_RE.match(l))]
+    if out:
+        return out
+    under, k = False, 0
+    for n, l in enumerate(lines, 1):
+        if l.startswith("#"):
+            under = bool(re.search(r"불변식|invariant", l, re.I))
+            continue
+        m = re.match(r"^\s*[-*]\s+(.+?)\s*$", l)
+        if under and m and not m.group(1).startswith("근거"):
+            k += 1
+            out.append((f"I{k}", m.group(1), n))
+    return out
+
+
+def read_coverage(path: Path):
+    """Parse a coverage file: (header lines, entry rows, invariant rows, problems)."""
+    header, entries, invs, problems = [], [], [], []
+    section = None
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.startswith("## "):
+            section = "entries" if "entry" in line.lower() else "invariants" if "invariant" in line.lower() else None
+            continue
+        if not line.startswith("|"):
+            if section is None:
+                header.append(line)
+            continue
+        cells = split_md_row(line)
+        if cells and (cells[0] in ("id", "") or set(cells[0]) <= set("-: ")):
+            continue
+        cols = ENTRY_COLS if section == "entries" else INV_COLS if section == "invariants" else None
+        if cols is None:
+            continue
+        if len(cells) != len(cols):
+            problems.append(f"line {n}: expected {len(cols)} cells, got {len(cells)}")
+            cells = (cells + [""] * len(cols))[:len(cols)]
+        row = dict(zip(cols, cells))
+        row["_line"] = n
+        (entries if section == "entries" else invs).append(row)
+    return header, entries, invs, problems
+
+
+def write_coverage(path: Path, header, entries, invs):
+    out = list(header)
+    while out and not out[-1].strip():
+        out.pop()
+    out += ["", "## Entry points", "", "| " + " | ".join(ENTRY_COLS) + " |",
+            "|" + "---|" * len(ENTRY_COLS)]
+    out += ["| " + " | ".join(md_cell(r.get(c, "")) for c in ENTRY_COLS) + " |" for r in entries]
+    out += ["", "## Invariants", "", "| " + " | ".join(INV_COLS) + " |", "|" + "---|" * len(INV_COLS)]
+    out += ["| " + " | ".join(md_cell(r.get(c, "")) for c in INV_COLS) + " |" for r in invs]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def coverage_default_path(project, run_id) -> Path:
+    base = Path(os.path.expanduser(os.environ.get("QA_WORK", str(HOME / ".qa-work"))))
+    return base / project / run_id / "coverage.md"
+
+
+def coverage_file_arg(args) -> Path:
+    if args.file:
+        return Path(os.path.expanduser(args.file))
+    if args.project and args.run:
+        return coverage_default_path(args.project, args.run)
+    die("pass --file <coverage.md>, or --project and --run for $QA_WORK/<project>/<run>/coverage.md")
+
+
+AUTHZ_MARK_RE = re.compile(r"^(?:[\w$]*(?:Permission|Role|Scope|Polic|Abilit|Acl|Rbac|Admin|Staff|Owner)[\w$]*\(|"
+                           r"UseGuards\([^)]*(?:Auth|Role|Permission|Admin|Rbac|Acl|Owner|Bearer|Staff|Polic|Scope|"
+                           r"ApiKey|Token|Access))", re.I)
+
+
+def is_guarded(r) -> bool:
+    """Permission-guarded: a permission/role decorator or an auth-like guard (feature-flag guards do not count)."""
+    return bool(AUTHZ_MARK_RE.search(r.get("auth") or "")) or any(
+        AUTHZ_MARK_RE.match(m.strip()) for m in (r.get("auth") or "").split(", "))
+
+
+def entry_group(r) -> str:
+    if r["kind"] in ("http", "webhook"):
+        if r["method"] in READ_METHODS:
+            return "reads"
+        return "permission-guarded writes" if is_guarded(r) else "other writes"
+    return "jobs, events, queues, actions"
+
+
+def row_status(cells):
+    states = [COVERAGE_CELL_RE.match(c).group(1) if COVERAGE_CELL_RE.match(c) else "blank" for c in cells]
+    for s in ("blank", "not_done", "checked"):
+        if s in states:
+            return s
+    return "out_of_scope"
+
+
+def cmd_coverage(args):
+    if args.action == "init":
+        if not args.repo or not args.scope:
+            die("coverage init needs --repo and --scope")
+        repo = Path(os.path.expanduser(args.repo)).resolve()
+        if not repo.is_dir():
+            die(f"no such repo: {repo}")
+        out = coverage_file_arg(args)
+        scope = normalize_scope(repo, args.scope)
+        rows, notes = extract_entry_points(repo, scope)
+        guards, prefix = repo_globals(repo)
+        head = run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"]).stdout.strip() or "?"
+        dirty = run(["git", "-C", str(repo), "status", "--porcelain"]).stdout.strip()
+        old_e, old_i = {}, {}
+        if out.exists():
+            _, oe, oi, _ = read_coverage(out)
+            old_e = {f"{r['kind']} {r['method']} {r['route']}": r for r in oe}
+            old_i = {r["invariant"]: r for r in oi}
+        used = {r["id"] for r in old_e.values()}
+        nxt = max([int(i[1:]) for i in used if re.fullmatch(r"E\d+", i)] or [0]) + 1
+        entries = []
+        for r in rows:
+            prev = old_e.get(row_key(r))
+            if prev:
+                r["id"] = prev["id"]
+                for a in COVERAGE_AXES:
+                    r[a] = prev.get(a, "")
+            else:
+                r["id"] = f"E{nxt:03d}"
+                nxt += 1
+            entries.append(r)
+        dropped = set(old_e) - {row_key(r) for r in rows}
+        invs = list(old_i.values())
+        if args.invariants:
+            ipath = Path(os.path.expanduser(args.invariants))
+            if not ipath.exists():
+                die(f"no such file: {ipath}")
+            used_i = {r["id"] for r in invs}
+            for iid, text, line in parse_invariants(ipath):
+                if text in old_i:
+                    continue
+                if iid in used_i:  # an invariant added later that reuses an id gets the next free one
+                    iid = f"I{max([int(x[1:]) for x in used_i if x[1:].isdigit()] or [0]) + 1}"
+                used_i.add(iid)
+                invs.append({"id": iid, "invariant": text, "source": f"{ipath.name}:{line}", "check": ""})
+        header = [
+            f"# Coverage — {args.project or '-'} {args.run or ''}".rstrip(),
+            "",
+            "<!-- qa-coverage v1: generated by `qa coverage init`; fill cells with `qa coverage set`; "
+            "`qa coverage check` must pass before the report -->",
+            f"- repo: `{repo.name}` @ {head}{' (uncommitted changes)' if dirty else ''}",
+            f"- scope: {', '.join(scope)}",
+            f"- generated: {now_iso()}",
+            f"- app-wide guards (apply to rows whose auth is `-`): {', '.join(guards) or 'none found'}"
+            f"; route prefix: {('/' + prefix.strip('/')) if prefix else 'none'}",
+            "- axes: " + " · ".join(f"`{a}` {COVERAGE_AXIS_HELP[a]}" for a in COVERAGE_AXES),
+            "- every cell: `checked: <evidence ref>` · `out_of_scope: <reason>` · `not_done: <reason>`",
+        ]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_coverage(out, header, entries, invs)
+        groups = {}
+        for r in entries:
+            groups[entry_group(r)] = groups.get(entry_group(r), 0) + 1
+        kinds = {}
+        for r in entries:
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        print(f"{out}")
+        print(f"{len(entries)} entry points ({', '.join(f'{k} {v}' for k, v in kinds.items()) or 'none'}), "
+              f"{len(invs)} invariants, {len(entries) * len(COVERAGE_AXES) + len(invs)} cells to fill")
+        for g in ("permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"):
+            print(f"  {g:<32} {groups.get(g, 0)}")
+        if dropped:
+            print(f"note: {len(dropped)} row(s) from the previous table no longer match the code and were dropped: "
+                  + ", ".join(sorted(dropped)[:5]), file=sys.stderr)
+        for n in notes:
+            print(f"warning: {n}", file=sys.stderr)
+        if not entries:
+            print("warning: no entry points found — check --scope", file=sys.stderr)
+        return 0
+
+    path = coverage_file_arg(args)
+    if not path.exists():
+        die(f"no coverage file at {path}; run `qa coverage init` first")
+    header, entries, invs, problems = read_coverage(path)
+
+    if args.action == "set":
+        values = [(s, v) for s, v in (("checked", args.checked), ("out_of_scope", args.out_of_scope),
+                                       ("not_done", args.not_done)) if v is not None]
+        if len(values) != 1 or not values[0][1].strip():
+            die("pass exactly one of --checked <evidence>, --out-of-scope <reason>, --not-done <reason>")
+        cell = f"{values[0][0]}: {values[0][1].strip()}"
+        axes = COVERAGE_AXES if (args.axis or "all") == "all" else split_list(args.axis)
+        bad = [a for a in axes if a not in COVERAGE_AXES]
+        if bad:
+            die(f"unknown axis {bad}; axes: {', '.join(COVERAGE_AXES)} or all")
+        ids = set()
+        for part in split_list(args.rows):
+            m = re.fullmatch(r"([EI])(\d+)-(?:[EI])?(\d+)", part)
+            if m:
+                ids |= {f"{m.group(1)}{k:03d}" if m.group(1) == "E" else f"I{k}"
+                        for k in range(int(m.group(2)), int(m.group(3)) + 1)}
+            else:
+                ids.add(part)
+        if not (ids or args.match or args.kind or args.group):
+            die("select rows with --rows, --match, --kind or --group")
+        n = 0
+        for r in entries:
+            if ids and r["id"] not in ids:
+                continue
+            if args.match and not any(fnmatch_ci(r[c], args.match) for c in ("route", "location")):
+                continue
+            if args.kind and r["kind"] != args.kind:
+                continue
+            if args.group and entry_group(r) != args.group:
+                continue
+            for a in axes:
+                if args.only_blank and r.get(a, "").strip():
+                    continue
+                r[a] = cell
+                n += 1
+        for r in invs:
+            if (ids and r["id"] in ids) or (args.match and fnmatch_ci(r["invariant"], args.match)
+                                            and not (args.kind or args.group)):
+                if args.only_blank and r.get("check", "").strip():
+                    continue
+                r["check"] = cell
+                n += 1
+        write_coverage(path, header, entries, invs)
+        print(f"{n} cell(s) set to {values[0][0]}")
+        return 0
+
+    if args.action != "check":
+        die(f"unknown coverage action {args.action}")
+    bad_cells = list(problems)
+    axis_counts = {a: {s: 0 for s in COVERAGE_STATES + ["blank"]} for a in COVERAGE_AXES}
+    groups = {}
+    for r in entries:
+        cells = [r.get(a, "") for a in COVERAGE_AXES]
+        for a, c in zip(COVERAGE_AXES, cells):
+            m = COVERAGE_CELL_RE.match(c)
+            if not c.strip():
+                axis_counts[a]["blank"] += 1
+                bad_cells.append(f"{r['id']} {a}: blank")
+            elif not m:
+                axis_counts[a]["blank"] += 1
+                bad_cells.append(f"{r['id']} {a}: not 'checked|out_of_scope|not_done: <text>' ({c[:40]})")
+            else:
+                axis_counts[a][m.group(1)] += 1
+        g = groups.setdefault(entry_group(r), {s: 0 for s in COVERAGE_STATES + ["blank"]})
+        g[row_status(cells)] += 1
+    inv_counts = {s: 0 for s in COVERAGE_STATES + ["blank"]}
+    for r in invs:
+        c = r.get("check", "")
+        m = COVERAGE_CELL_RE.match(c)
+        if not m:
+            bad_cells.append(f"{r['id']} check: {'blank' if not c.strip() else 'invalid (' + c[:40] + ')'}")
+        inv_counts[m.group(1) if m else "blank"] += 1
+    ids = [r["id"] for r in entries + invs]
+    dups = sorted({i for i in ids if ids.count(i) > 1})
+    if dups:
+        bad_cells.append(f"duplicate row ids: {', '.join(dups)}")
+    if not entries and not invs:
+        bad_cells.append("no rows: run `qa coverage init` with the run's scope")
+
+    def fmt(c):
+        return ", ".join(f"{s} {c[s]}" for s in COVERAGE_STATES) + (f", blank {c['blank']}" if c["blank"] else "")
+
+    summary = {"file": str(path), "entry_points": len(entries), "invariants": len(invs),
+               "groups": groups, "axes": axis_counts, "invariant_cells": inv_counts,
+               "problems": bad_cells, "pass": not bad_cells}
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0 if not bad_cells else 1
+    gw = groups.get("permission-guarded writes", {s: 0 for s in COVERAGE_STATES + ["blank"]})
+    print(f"coverage: {path}")
+    print(f"denominator: {len(entries)} entry points, {len(invs)} invariants")
+    print("rows (a row is not_done if any axis is, checked if any axis is checked, else out_of_scope):")
+    for g in ("permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"):
+        if g in groups:
+            print(f"  {g:<32} {sum(groups[g].values()):>4} — {fmt(groups[g])}")
+    print(f"  {'invariants':<32} {len(invs):>4} — {fmt(inv_counts)}")
+    print("cells by axis:")
+    for a in COVERAGE_AXES:
+        print(f"  {a:<6} {fmt(axis_counts[a])}")
+    print("report header: "
+          f"permission-guarded write entry points {sum(gw.values())}: {fmt(gw)}; "
+          f"all entry points {len(entries)}: {fmt({s: sum(g[s] for g in groups.values()) for s in COVERAGE_STATES + ['blank']})}; "
+          f"invariants {len(invs)}: {fmt(inv_counts)}")
+    if bad_cells:
+        for p in bad_cells[:15]:
+            print(f"FAIL {p}", file=sys.stderr)
+        if len(bad_cells) > 15:
+            print(f"FAIL … {len(bad_cells) - 15} more", file=sys.stderr)
+        print(f"coverage check failed: {len(bad_cells)} problem(s); the report cannot pass until every cell "
+              "is checked, out_of_scope or not_done with a reason", file=sys.stderr)
+        return 1
+    print("coverage check passed")
+    return 0
+
+
+def fnmatch_ci(value: str, pattern: str) -> bool:
+    import fnmatch
+    return fnmatch.fnmatch(value.lower(), pattern.lower()) or pattern.lower() in value.lower()
+
+
+# --------------------------------------------------------------------------
+# qa seed — plant known defects in a throwaway copy and measure the miss rate
+# --------------------------------------------------------------------------
+
+OWNER_KEY_RE = re.compile(r"^(userId|memberId|ownerId|customerId|accountId|authorId|createdBy|createdById|"
+                          r"tenantId|organizationId|orgId|user_id|member_id|owner_id)$")
+STATE_KEY_RE = re.compile(r"^(status|state|[a-z][\w$]*Status|[a-z][\w$]*State|status_cd|state_cd)$")
+IDEMP_COND_RE = re.compile(r"existing|already|duplicat|idempot|processed|dedup|\bseen\b", re.I)
+CONFLICT_BODY_RE = re.compile(r"Conflict|409|already|duplicat|idempot", re.I)
+LITERAL_RE = re.compile(r"^(null|undefined|true|false|-?\d+)$")
+TX_READ_RE = r"\b{tx}\.([\w$]+)\.(findFirst|findUnique|findMany|findFirstOrThrow|findUniqueOrThrow|count|aggregate|groupBy)\s*\("
+SEED_LINE_TOLERANCE = 15
+# Dev-only code (data seeding, fixtures, migrations, scripts) is not a runtime path; never plant there.
+SEED_SKIP_RE = re.compile(r"(^|/)(seeds?|fixtures?|mocks?|__mocks__|migrations?|scripts?)(/|$)|(^|/)seed[-_.]", re.I)
+
+SEED_OPS = {
+    "drop-authz-decorator": {
+        "axis": "authz",
+        "what": "remove a permission/role/guard decorator from a write endpoint",
+        "symptoms": ["permission", "authoriz", "guard", "rbac", "role", "access control", "unauthori",
+                     "forbidden", "privilege", "권한", "인가"],
+    },
+    "drop-owner-condition": {
+        "axis": "authz",
+        "what": "remove the ownership condition (userId/memberId/…) from a query filter",
+        "symptoms": ["owner", "another user", "other user", "other member", "someone else", "idor", "belong",
+                     "any user", "cross-account", "타인", "남의", "소유"],
+    },
+    "drop-idempotency-check": {
+        "axis": "dup",
+        "what": "remove a duplicate/idempotency check (`if (existing…) throw/return`)",
+        "symptoms": ["duplicate", "idempot", "twice", "double", "replay", "already", "retry", "중복", "두 번"],
+    },
+    "unconditional-state-update": {
+        "axis": "conc",
+        "what": "drop the state condition from an update's where clause (unconditional transition)",
+        "symptoms": ["state", "status", "transition", "overwrite", "race", "concurrent", "conditional",
+                     "상태", "동시"],
+    },
+    "drop-audit-call": {
+        "axis": "audit",
+        "what": "remove an audit-record call",
+        "symptoms": ["audit", "감사", "record", "trail", "log"],
+    },
+    "read-outside-transaction": {
+        "axis": "conc",
+        "what": "move a read inside a transaction onto the non-transaction client",
+        "symptoms": ["transaction", "race", "concurrent", "lock", "stale", "toctou", "트랜잭션", "동시"],
+    },
+}
+
+
+def enclosing_function(sf: SourceFile, idx: int) -> str:
+    name = ""
+    for m in re.finditer(r"^[ \t]*(?:(?:public|private|protected|static|async|export|function)\s+)*"
+                         r"([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^;\n]*$", sf.masked[:idx], re.M):
+        if m.group(1) not in KEYWORDS:
+            name = m.group(1)
+    return name
+
+
+def object_entries(masked: str, open_i: int, close_i: int):
+    """Top-level `key: value` / shorthand entries of the object literal between braces: [(key, start, end)]."""
+    out, depth, start = [], 0, open_i + 1
+    for k in range(open_i + 1, close_i + 1):
+        c = masked[k]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}" and k != close_i:
+            depth -= 1
+        if (c == "," and depth == 0) or k == close_i:
+            seg = masked[start:k]
+            m = re.match(r"\s*([A-Za-z_$][\w$]*)\s*(:|$|\s*$)", seg)
+            if seg.strip() and m:
+                out.append((m.group(1), start, k))
+            start = k + 1
+    return out
+
+
+def removal_span(sf: SourceFile, start: int, end: int):
+    """Span that removes one object entry with its comma, keeping the literal valid."""
+    t = sf.text
+    s, e = start, end
+    while s < e and t[s] in " \t\n":
+        s += 1
+    while e > s and t[e - 1] in " \t\n":
+        e -= 1
+    if end < len(t) and t[end] == ",":
+        return sf.whole_lines(s, end + 1)
+    p = start - 1  # last entry: take the preceding comma instead
+    while p > 0 and t[p] in " \t\n":
+        p -= 1
+    if t[p] == ",":
+        return p, e
+    return sf.whole_lines(s, e)
+
+
+def seed_sites(repo: Path, scope, ops=None):
+    """Every place a seed operator can plant a defect: [{op, file, line, start, end, new, function, before}]."""
+    ops = ops or list(SEED_OPS)
+    sites = []
+    for rel_path in source_files(repo, scope):
+        if SEED_SKIP_RE.search(rel_path):
+            continue
+        try:
+            sf = SourceFile(repo, rel_path)
+        except OSError:
+            continue
+        t, mk = sf.text, sf.masked
+
+        def add(op, start, end, new="", function=None):
+            ln = sf.line(start if t[start:start + 1] != "\n" else start + 1)
+            sites.append({"op": op, "file": rel_path, "line": ln, "start": start, "end": end, "new": new,
+                          "function": function or enclosing_function(sf, start), "before": t[start:end]})
+
+        if "drop-authz-decorator" in ops and "@" in mk:
+            for cls, cdecos, meth, mdecos, line in scan_ts_members(sf):
+                if not any(d.name == "Controller" for d in cdecos):
+                    continue
+                http = [d for d in mdecos if d.name in HTTP_DECORATORS]
+                if not http or all(HTTP_DECORATORS[d.name] in READ_METHODS for d in http):
+                    continue
+                for d in mdecos:
+                    if d.name not in PUBLIC_DECORATORS and not d.name.startswith("Api") \
+                            and AUTH_DECORATOR_RE.search(d.name):
+                        s, e = sf.whole_lines(d.start, d.end)
+                        add("drop-authz-decorator", s, e, function=meth)
+        if "drop-owner-condition" in ops or "unconditional-state-update" in ops:
+            for wm in re.finditer(r"\bwhere\s*:\s*\{", mk):
+                w_open = wm.end() - 1
+                w_close = match_bracket(mk, w_open)
+                in_update = re.search(r"\.(update|updateMany)\s*\(\s*\{[^;]*$", mk[max(0, wm.start() - 400):wm.start()])
+                objs = [w_open] + [k for k in range(w_open + 1, w_close) if mk[k] == "{"]
+                for o in objs:
+                    c = match_bracket(mk, o)
+                    entries = object_entries(mk, o, c)
+                    for key, s, e in entries:
+                        value = t[s:e].split(":", 1)[1].strip() if ":" in mk[s:e] else key
+                        if "drop-owner-condition" in ops and OWNER_KEY_RE.match(key) \
+                                and not LITERAL_RE.match(value) and not value.startswith("{"):
+                            rs, re_ = removal_span(sf, s, e)
+                            add("drop-owner-condition", rs, re_)
+                        if "unconditional-state-update" in ops and in_update and o == w_open \
+                                and STATE_KEY_RE.match(key) and len(entries) >= 2:
+                            rs, re_ = removal_span(sf, s, e)
+                            add("unconditional-state-update", rs, re_)
+        if "drop-idempotency-check" in ops:
+            for im in re.finditer(r"\bif\s*\(", mk):
+                c_open = im.end() - 1
+                c_close = match_bracket(mk, c_open)
+                cond = t[c_open + 1:c_close]
+                k = c_close + 1
+                while k < len(mk) and mk[k] in " \t\n":
+                    k += 1
+                if k >= len(mk):
+                    continue
+                if mk[k] == "{":
+                    b_end = match_bracket(mk, k) + 1
+                else:
+                    semi = mk.find(";", k)
+                    if semi < 0:
+                        continue
+                    b_end = semi + 1
+                body = t[k:b_end]
+                after = mk[b_end:b_end + 40].lstrip()
+                if after.startswith("else") or mk[im.start() - 5:im.start()].rstrip().endswith("else"):
+                    continue
+                if not re.search(r"\bthrow\b|\breturn\b", body) or re.search(r"NotFound", body):
+                    continue
+                if (IDEMP_COND_RE.search(cond) and not cond.strip().startswith("!")) or CONFLICT_BODY_RE.search(body):
+                    s, e = sf.whole_lines(im.start(), b_end)
+                    add("drop-idempotency-check", s, e)
+        if "drop-audit-call" in ops and re.search(r"audit", t, re.I):
+            for am in re.finditer(r"^[ \t]*(?:await\s+|void\s+)?((?:this\.)?[\w$]+(?:\.[\w$]+)*)\s*\(", mk, re.M):
+                callee = am.group(1)
+                open_i = am.end() - 1
+                close_i = match_bracket(mk, open_i)
+                first_arg = t[open_i + 1:min(close_i, open_i + 120)]
+                is_audit = re.search(r"audit", callee, re.I) or (
+                    re.search(r"\.emit(Async)?$", callee) and re.search(r"audit", first_arg.split(",")[0], re.I))
+                if not is_audit or callee.split(".")[0] in KEYWORDS:
+                    continue
+                k = close_i + 1
+                while k < len(mk) and mk[k] in " \t\n":
+                    k += 1
+                while mk.startswith(".catch", k) or mk.startswith(".then", k):
+                    k = match_bracket(mk, mk.find("(", k)) + 1
+                    while k < len(mk) and mk[k] in " \t\n":
+                        k += 1
+                if k < len(mk) and mk[k] == ";":
+                    s, e = sf.whole_lines(am.start(), k + 1)
+                    add("drop-audit-call", s, e)
+        if "read-outside-transaction" in ops and "$transaction" in mk:
+            for tm in re.finditer(r"([\w$.]+)\.\$transaction\s*\(", mk):
+                client = tm.group(1)
+                open_i = tm.end() - 1
+                close_i = match_bracket(mk, open_i)
+                inner = mk[open_i + 1:close_i]
+                pm = re.match(r"\s*async\s*(?:\(\s*([\w$]+)\s*(?::[^)]*)?\)|([\w$]+))\s*=>", inner)
+                if not pm:
+                    continue
+                tx = pm.group(1) or pm.group(2)
+                for rm in re.finditer(TX_READ_RE.format(tx=re.escape(tx)), inner):
+                    s = open_i + 1 + rm.start()
+                    add("read-outside-transaction", s, s + len(tx), client)
+    sites.sort(key=lambda x: (x["op"], x["file"], x["start"]))
+    return sites
+
+
+def plant(work: Path, site: dict):
+    f = work / site["file"]
+    text = f.read_text(encoding="utf-8", errors="replace")
+    if text[site["start"]:site["end"]] != site["before"]:
+        die(f"seed site moved: {site['file']}:{site['line']}")
+    f.write_text(text[:site["start"]] + site["new"] + text[site["end"]:], encoding="utf-8")
+
+
+def pick_seeds(sites, n, rng_seed):
+    """n sites spread round-robin over the operators, deterministic for a given rng seed."""
+    import random
+    rnd = random.Random(rng_seed)
+    by_op = {}
+    for s in sites:
+        by_op.setdefault(s["op"], []).append(s)
+    for v in by_op.values():
+        rnd.shuffle(v)
+    picked, ops = [], sorted(by_op)
+    while len(picked) < n and any(by_op.values()):
+        for op in ops:
+            if by_op[op] and len(picked) < n:
+                picked.append(by_op[op].pop())
+    return picked
+
+
+def seed_manifest_dir() -> Path:
+    # Outside every snapshot and outside the knowledge repo: the agent never gets a path to it.
+    return eval_base() / "manifests"
+
+
+def output_locations(out: str):
+    locs = []
+    for m in re.finditer(r"([\w./@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rb|php|cs|prisma|sql))"
+                         r"(?::(\d+)(?:-(\d+))?)?", out):
+        locs.append((m.group(1), int(m.group(2)) if m.group(2) else None, m.start()))
+    return locs
+
+
+def location_match(out: str, path: str, line, function="", tol=SEED_LINE_TOLERANCE) -> str:
+    """'yes' when the output names the file with a nearby line (or the function), 'partial' for the file only."""
+    base = Path(path).name
+    best = "no"
+    for p, ln, _ in output_locations(out):
+        if Path(p).name != base or ("/" in p and not (path.endswith(p.lstrip("./")) or p.endswith(path))):
+            continue
+        if line is None or (ln is not None and abs(ln - line) <= tol):
+            return "yes"
+        best = "partial"
+    if best == "partial" and function and re.search(rf"\b{re.escape(function)}\b", out):
+        return "yes"
+    if best == "no" and function and len(function) > 3 and re.search(rf"\b{re.escape(function)}\b", out) \
+            and base in out:
+        return "partial"
+    return best
+
+
+def grade_seed(out: str, site: dict) -> str:
+    loc = location_match(out, site["file"], site["line"], site.get("function", ""))
+    low = out.lower()
+    sym = any(k.lower() in low for k in SEED_OPS[site["op"]]["symptoms"])
+    if loc == "yes" and sym:
+        return "found"
+    if loc == "yes" or (loc == "partial" and sym):
+        return "partial"
+    return "missed"
+
+
+def cmd_seed(args):
+    if args.action == "list" and not args.repo:
+        print("seed operators (one planted defect per throwaway copy):")
+        for op, spec in SEED_OPS.items():
+            print(f"  {op:<28} [{spec['axis']}] {spec['what']}")
+        print("pass --repo and --scope to list the sites in a code scope")
+        return 0
+    if not args.repo or not args.scope:
+        die(f"seed {args.action} needs --repo and --scope")
+    repo = Path(os.path.expanduser(args.repo)).resolve()
+    if not (repo / ".git").exists():
+        die(f"{repo} is not a git repository (copies are made with git archive)")
+    scope = normalize_scope(repo, args.scope)
+    ops = split_list(args.ops) or None
+    if ops and set(ops) - set(SEED_OPS):
+        die(f"unknown operators {sorted(set(ops) - set(SEED_OPS))}; see `qa seed list`")
+    commit = args.commit or "HEAD"
+    if run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+        die(f"commit {commit} not found in {repo}")
+    dirty = run(["git", "-C", str(repo), "status", "--porcelain", "--", *scope]).stdout.strip()
+    if dirty and commit == "HEAD":
+        print("warning: the scope has uncommitted changes; copies are made from HEAD", file=sys.stderr)
+    # Sites are found in the committed tree the copy is made from, never in the working tree.
+    with tempfile.TemporaryDirectory(prefix="qa-seed-scan-") as tmp:
+        scan = Path(tmp)
+        arch = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", commit, "--", *scope],
+                                stdout=subprocess.PIPE)
+        tar = subprocess.run(["tar", "-x", "-C", str(scan)], stdin=arch.stdout)
+        arch.stdout.close()
+        if arch.wait() != 0 or tar.returncode != 0:
+            die("git archive of the scope failed (is every scope path committed?)")
+        sites = seed_sites(scan, scope, ops)
+
+    if args.action == "list":
+        counts = {}
+        for s in sites:
+            counts[s["op"]] = counts.get(s["op"], 0) + 1
+        for op in SEED_OPS:
+            if not ops or op in ops:
+                print(f"{op:<28} {counts.get(op, 0):>4} site(s)")
+        if args.sites:
+            for i, s in enumerate(sites, 1):
+                print(f"  {i:>4}  {s['op']:<28} {s['file']}:{s['line']}  {s['function']}")
+        return 0
+
+    if args.action == "apply":
+        if args.site:
+            chosen = []
+            for k in split_list(args.site):
+                if not k.isdigit() or not 1 <= int(k) <= len(sites):
+                    die(f"--site takes numbers from `qa seed list --sites` (1..{len(sites)})")
+                chosen.append(sites[int(k) - 1])
+        else:
+            chosen = pick_seeds(sites, args.seeds or 1, args.rng_seed)
+        if not chosen:
+            die("no seed sites in this scope")
+        token = secrets.token_hex(5)
+        work = Path(os.path.expanduser(args.out)) if args.out else eval_base() / f"w-{token}"
+        make_snapshot(repo, commit, work, mutate=lambda w: [plant(w, s) for s in chosen])
+        manifest = seed_manifest_dir() / f"seed-{token}.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({"copy": str(work), "commit": commit, "scope": scope, "seeds": chosen},
+                                       ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"copy: {work}\nmanifest (keep out of any prompt): {manifest}")
+        for s in chosen:
+            print(f"  planted {s['op']} at {s['file']}:{s['line']}")
+        return 0
+
+    if args.action != "run":
+        die(f"unknown seed action {args.action}")
+    kb = resolve_kb(args.kb)
+    if not args.project:
+        die("seed run needs --project")
+    n = args.seeds or 5
+    chosen = pick_seeds(sites, n, args.rng_seed)
+    if len(chosen) < n:
+        print(f"warning: only {len(chosen)} seed site(s) in this scope", file=sys.stderr)
+    base = eval_base()
+    started = stamp()
+    batch = secrets.token_hex(5)
+    manifest = seed_manifest_dir() / f"seedrun-{batch}.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    stage = None
+    shown = []
+    if not args.no_patterns:
+        stage = base / f"p-{secrets.token_hex(5)}"
+        shown = stage_patterns(kb, stage, [])
+    prompt = headless_prompt(scope, stage / "patterns" if stage else None, args.feature, located=True)
+    needles = sorted({"qa-knowledge", str(kb), str(kb.resolve()), str(seed_manifest_dir()), "manifests/seed",
+                      *SEED_OPS})
+    results = []
+    for i, s in enumerate(chosen, 1):
+        work = base / f"w-{secrets.token_hex(5)}"
+        make_snapshot(repo, commit, work, mutate=lambda w, s=s: plant(w, s))
+        cmd = headless_cmd(stage, prompt, args.model, args.max_budget)
+        refuse_exposed(cmd + [str(work)], needles)
+        row = {"n": i, "seed": s, "copy": str(work)}
+        if args.dry_run:
+            row["result"] = "dry-run"
+            print(f"[{i}/{len(chosen)}] copy {work}: {s['op']} at {s['file']}:{s['line']} (hidden from the prompt)")
+        else:
+            print(f"[{i}/{len(chosen)}] running qa-breaker in {work} (timeout {args.timeout} min)…", file=sys.stderr)
+            transcript = base / "transcripts" / f"{args.project}-seed-{batch}-{i}.jsonl"
+            out, err, code, secs, leaks = headless_run(cmd, work, args.timeout, needles, transcript)
+            row.update({"validity": validity_status(leaks, code), "secs": secs,
+                        "result": grade_seed(out, s) if not leaks and code == 0 else "invalid",
+                        "transcript": str(transcript), "output": out})
+            if not args.keep:
+                shutil.rmtree(work, ignore_errors=True)
+        results.append(row)
+        manifest.write_text(json.dumps({"commit": commit, "scope": scope, "rows": results},
+                                       ensure_ascii=False, indent=1), encoding="utf-8")
+    if args.dry_run:
+        print(f"pattern dir: {stage or 'off'} ({len(shown)} shown)\n"
+              f"command: {' '.join(headless_cmd(stage, prompt, args.model, args.max_budget)[:-1])} <prompt>\n"
+              f"--- prompt (identical for every copy) ---\n{prompt}\n--- \n"
+              f"manifest: {manifest}\n"
+              f"result table would go to evals/{args.project}/seed-results/{started}-{batch}.md")
+        if not args.keep:
+            for r in results:
+                shutil.rmtree(r["copy"], ignore_errors=True)
+            if stage:
+                shutil.rmtree(stage, ignore_errors=True)
+            manifest.unlink(missing_ok=True)
+            print("dry run: copies, pattern dir and manifest removed (--keep to inspect them)")
+        return 0
+    if stage and not args.keep:
+        shutil.rmtree(stage, ignore_errors=True)
+    res_dir = kb / "evals" / args.project / "seed-results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    res = res_dir / f"{started}-{batch}.md"
+    res.write_text(seed_report(args, commit, scope, results, len(shown)), encoding="utf-8")
+    print(rel(kb, res))
+    valid = [r for r in results if r["result"] != "invalid"]
+    missed = sum(1 for r in valid if r["result"] == "missed")
+    print(f"{len(valid)} valid of {len(results)}; missed {missed} ({missed / len(valid):.0%})" if valid
+          else "no valid runs", file=sys.stderr)
+    return 0
+
+
+def seed_report(args, commit, scope, results, n_patterns) -> str:
+    valid = [r for r in results if r["result"] != "invalid"]
+    by_op = {}
+    for r in valid:
+        d = by_op.setdefault(r["seed"]["op"], {"found": 0, "partial": 0, "missed": 0})
+        d[r["result"]] += 1
+    lines = [f"# Seeded-defect run — {args.project} {stamp()}", "",
+             f"- commit: `{commit}` · scope: {', '.join(scope)} · patterns shown: {n_patterns}"
+             f" · model: {args.model or 'default'}",
+             "- one planted defect per throwaway copy; the prompt is the scope only (same for every copy)",
+             "- auto grade: found = location (file + line ±15 or function) and symptom words; "
+             "partial = one of them; human column decides", "",
+             "| op | axis | n | found | partial | missed | miss rate |", "|---|---|---|---|---|---|---|"]
+    for op, d in sorted(by_op.items()):
+        n = sum(d.values())
+        lines.append(f"| {op} | {SEED_OPS[op]['axis']} | {n} | {d['found']} | {d['partial']} | {d['missed']} "
+                     f"| {d['missed'] / n:.0%} |")
+    missed = sum(d["missed"] for d in by_op.values())
+    lines += [f"| **all** | | {len(valid)} | {sum(d['found'] for d in by_op.values())} | "
+              f"{sum(d['partial'] for d in by_op.values())} | {missed} | "
+              f"{(missed / len(valid)) if valid else 0:.0%} |", "",
+              f"Invalid runs (excluded): {len(results) - len(valid)}", "",
+              "| # | op | planted at | function | auto | human | validity | transcript |",
+              "|---|---|---|---|---|---|---|---|"]
+    for r in results:
+        s = r["seed"]
+        lines.append(f"| {r['n']} | {s['op']} | `{s['file']}:{s['line']}` | {md_cell(s['function'])} | "
+                     f"{r['result']} | [ ] found [ ] partial [ ] missed | {md_cell(r.get('validity', ''))} | "
+                     f"`{r.get('transcript', '')}` |")
+    lines += ["", "## Agent outputs", ""]
+    for r in results:
+        lines += [f"### {r['n']}. {r['seed']['op']}", "", (r.get("output") or "(no output)").strip(), ""]
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# qa rederive — blind re-run of a finished run, then compare
+# --------------------------------------------------------------------------
+
+def run_scope(lf: Path):
+    ev = None
+    for _, e in read_ledger(lf):
+        if e.get("type") == "scope":
+            ev = e
+    return ev or {}
+
+
+def rederive_hidden_patterns(kb: Path, lf: Path, run_id: str):
+    """Patterns this run gave birth to: attributions whose proposal item created the pattern (`new-pattern`).
+    Attributions to patterns that already existed (nearest-pattern stats) stay visible. Without a readable
+    source, a pattern created after the run date and not used by any of its findings counts as derived."""
+    run_date = run_id[:10] if DATE_RE.match(run_id[:10]) else None
+    if run_date is None:
+        ats = [str(e.get("at", ""))[:10] for _, e in read_ledger(lf) if e.get("at")]
+        run_date = min(ats) if ats else "0000-00-00"
+    used = set()
+    for _, e in read_ledger(lf):
+        if e.get("type") == "finding":
+            used.update(e.get("patterns") or [])
+    created = {p.id: str(((p.meta.get("validity") or {}).get("created_at")) or "") for p in load_patterns(kb)}
+    proposals = {}
+    hidden = set()
+    for _, e in read_ledger(lf):
+        if e.get("type") != "attribution":
+            continue
+        src = str(e.get("source") or "")
+        fname, _, item = src.partition("#")
+        op = None
+        if fname and item:
+            if fname not in proposals:
+                pf = kb / "proposals" / fname
+                proposals[fname] = {i["id"]: i["spec"] for i in parse_proposal(pf.read_text(encoding="utf-8"))} \
+                    if pf.exists() else {}
+            spec = proposals[fname].get(item)
+            op = spec.get("op") if spec else None
+        for pid in e.get("patterns") or []:
+            if op == "new-pattern" or (op is None and pid not in used and created.get(pid, "") > run_date):
+                hidden.add(pid)
+    return sorted(hidden)
+
+
+def finding_locations(f: dict):
+    """(path, line) pairs from a ledger finding's location ('a.ts:10, b.ts#fn')."""
+    out = []
+    for part in re.split(r"[,;\s]+", str(f.get("location") or "")):
+        m = re.match(r"([^:#]+\.[A-Za-z]+)(?::(\d+))?", part)
+        if m:
+            out.append((m.group(1), int(m.group(2)) if m.group(2) else None))
+    return out
+
+
+def output_candidates(out: str):
+    """Candidates of a located run: each `Location: path:line` line, titled by the last numbered/heading line."""
+    cands, title = [], ""
+    for line in out.splitlines():
+        st = line.strip()
+        m = re.match(r"^[-*\s]*\**location\**\s*:\s*\**`?([^\s`*]+?):(\d+)", st, re.I)
+        if m:
+            loc = (m.group(1), int(m.group(2)))
+            if cands and cands[-1]["title"] == title:
+                cands[-1]["locs"].append(loc)
+            else:
+                cands.append({"title": title, "locs": [loc]})
+        elif re.match(r"^(?:#+\s*|\*\*)?(?:\d+[.)]|candidate\s+\d+[:.]?)\s+\S", st, re.I):
+            title = st.strip("#* ")[:120]
+    for c in cands:
+        c["text"] = " ".join(f"{p}:{n}" for p, n in c["locs"])
+    return cands
+
+
+def rederive_compare(state: dict, out: str):
+    """Match the blind run's candidates against the original findings by location."""
+    cands = output_candidates(out)
+    orig, matched = [], set()
+    for fid, s in state.items():
+        f, j = s["finding"], s["judgment"]
+        best = "no"
+        for ci, c in enumerate(cands):
+            for p, ln in finding_locations(f):
+                m = location_match(c["text"], p, ln, tol=20)
+                if m == "yes":
+                    best = "yes"
+                    matched.add(ci)
+                elif m == "partial" and best == "no":
+                    best = "partial"
+        orig.append({"id": fid, "title": f["title"], "severity": f["severity"],
+                     "verdict": f"{j['verdict']} ({j['severity']})" if j else "untriaged", "auto": best})
+    new = [c for ci, c in enumerate(cands) if ci not in matched]
+    return orig, new, cands
+
+
+def cmd_rederive(args):
+    kb = resolve_kb(args.kb)
+    lf = ledger_path(kb, args.project, args.run)
+    sc = run_scope(lf)
+    commit = args.commit or sc.get("commit")
+    scope = args.scope or sc.get("paths")
+    if not commit or not scope:
+        die("the run has no scope record; pass --commit and --scope (or record one with `qa finding scope`)")
+    repo = resolve_repo(kb, args.project, args.repo)
+    if run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+        die(f"commit {commit} not found in {repo}")
+    scope = normalize_scope(repo, scope)
+    state = ledger_state(lf)
+    hidden = rederive_hidden_patterns(kb, lf, args.run)
+    base = eval_base()
+    started = stamp()
+    token = secrets.token_hex(5)
+    work = base / f"w-{token}"
+    make_snapshot(repo, commit, work)
+    stage, shown = None, []
+    if not args.no_patterns:
+        stage = base / f"p-{secrets.token_hex(5)}"
+        shown = stage_patterns(kb, stage, hidden)
+    prompt = headless_prompt(scope, stage / "patterns" if stage else None, args.feature or sc.get("feature"),
+                             located=True)
+    cmd = headless_cmd(stage, prompt, args.model, args.max_budget)
+    titles = [s["finding"]["title"] for s in state.values() if len(s["finding"].get("title", "")) >= 12]
+    needles = sorted({"qa-knowledge", str(kb), str(kb.resolve()), "findings.jsonl", args.run,
+                      f"runs/{args.run}", *hidden, *titles})
+    refuse_exposed(cmd, needles)
+    if stage:  # belt and braces: nothing staged may carry the run or its derived patterns
+        staged = "\n".join(f.read_text(encoding="utf-8") for f in stage.rglob("*.md"))
+        exposed = [n for n in [args.run, *hidden, *titles] if n in staged]
+        if exposed:
+            die(f"refusing to run: staged patterns expose {exposed}")
+    if args.dry_run:
+        print(f"snapshot: {work} (commit {commit}, history-free)\n"
+              f"pattern dir: {stage or 'off'} ({len(shown)} shown, hidden as derived from this run: "
+              f"{', '.join(hidden) or '-'})\n"
+              f"original findings hidden from the agent: {len(state)} "
+              f"({', '.join(state) or '-'}); report, judgments and refutations are not copied\n"
+              f"transcript check would search for: {', '.join(repr(n) for n in needles)}\n"
+              f"command: {' '.join(cmd[:-1])} <prompt>\n--- prompt ---\n{prompt}\n---\n"
+              f"comparison would go to {rel(kb, lf.parent)}/rederive-{started}.md")
+        if not args.keep:
+            shutil.rmtree(work, ignore_errors=True)
+            if stage:
+                shutil.rmtree(stage, ignore_errors=True)
+            print("dry run: snapshot and pattern dir removed (--keep to inspect them)")
+        return 0
+    print(f"running blind qa-breaker for {args.run} in {work} (timeout {args.timeout} min)…", file=sys.stderr)
+    transcript = base / "transcripts" / f"{args.project}-rederive-{token}.jsonl"
+    out, err, code, secs, leaks = headless_run(cmd, work, args.timeout, needles, transcript)
+    status = validity_status(leaks, code)
+    orig, new, cands = rederive_compare(state, out)
+    lines = [f"# Blind re-derivation: {args.run}", "", f"**Run validity: {status}**", "",
+             "| | |", "|---|---|", f"| commit | `{commit}` |", f"| scope | {', '.join(scope)} |",
+             f"| started | {started} |", f"| duration | {secs}s |", f"| model | {args.model or 'default'} |",
+             f"| patterns shown | {len(shown)} |", f"| patterns hidden (derived from this run) | {', '.join(hidden) or '-'} |",
+             f"| transcript | `{transcript}` (local only) |", "",
+             "## Original findings — re-derived blind?", "",
+             "| finding | title | finder severity | judgment | auto | human |", "|---|---|---|---|---|---|"]
+    lines += [f"| {o['id']} | {md_cell(o['title'])} | {o['severity']} | {o['verdict']} | {o['auto']} | "
+              "[ ] yes [ ] partial [ ] no |" for o in orig]
+    lines += ["", "## Found only by the blind run (originally missed?)", "",
+              "| # | candidate | location | human |", "|---|---|---|---|"]
+    lines += [f"| {i} | {md_cell(c['title'])} | {', '.join(f'`{p}:{n}`' for p, n in c['locs'])} | "
+              "[ ] real, missed [ ] not a defect [ ] same as original |" for i, c in enumerate(new, 1)]
+    lines += ["", f"Summary (auto): original {len(orig)} — re-derived "
+              f"{sum(o['auto'] == 'yes' for o in orig)}, partial {sum(o['auto'] == 'partial' for o in orig)}, "
+              f"only original {sum(o['auto'] == 'no' for o in orig)}; blind-only candidates {len(new)} "
+              f"of {len(cands)}", "", "## Agent output", "", out.strip() or "(no output)", ""]
+    res = lf.parent / f"rederive-{started}.md"
+    res.write_text("\n".join(lines), encoding="utf-8")
+    print(rel(kb, res))
+    print(f"run validity: {status}", file=sys.stderr)
+    if not args.keep:
+        shutil.rmtree(work, ignore_errors=True)
+        if stage:
+            shutil.rmtree(stage, ignore_errors=True)
+    return 0 if status == "valid" else 1
 
 
 # --------------------------------------------------------------------------
@@ -2559,8 +3982,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_pattern)
 
-    p = sub.add_parser("finding", help="add|review|judge|applied|list findings in a run ledger")
-    p.add_argument("action", choices=["add", "review", "judge", "applied", "list"])
+    p = sub.add_parser("finding", help="add|review|judge|applied|scope|list findings in a run ledger")
+    p.add_argument("action", choices=["add", "review", "judge", "applied", "scope", "list"])
     p.add_argument("--project", required=True)
     p.add_argument("--run", help="run id, e.g. 2026-10-21-payments (list: omit for every run of the project)")
     p.add_argument("--title")
@@ -2583,6 +4006,11 @@ def main(argv=None):
     p.add_argument("--duplicate-of")
     p.add_argument("--issue", help="judge: issue number(s) the finding was filed as, e.g. 999")
     p.add_argument("--related", help="judge: related existing issues or decisions, e.g. 405,406")
+    p.add_argument("--commit", help="scope: the commit the run read")
+    p.add_argument("--paths", help="scope: comma-separated repo-relative scope paths")
+    p.add_argument("--feature", help="scope: feature name in scope")
+    p.add_argument("--mode", choices=["code", "device", "both"], help="scope: run mode")
+    p.add_argument("--coverage", help="scope: the `qa coverage check` report header line")
     p.set_defaults(fn=cmd_finding)
 
     p = sub.add_parser("calibration", help="add|list severity calibration rows (client-neutral)")
@@ -2638,6 +4066,62 @@ def main(argv=None):
     p.add_argument("--out", help="report: write the markdown table to this file")
     p.set_defaults(fn=cmd_eval)
 
+    p = sub.add_parser("coverage", help="init|set|check the entry point x check axis table of a run")
+    p.add_argument("action", choices=["init", "set", "check"])
+    p.add_argument("--file", help="coverage file (default: $QA_WORK/<project>/<run>/coverage.md)")
+    p.add_argument("--project")
+    p.add_argument("--run")
+    p.add_argument("--repo", help="init: the client repo (read only)")
+    p.add_argument("--scope", nargs="+", help="init: repo-relative paths or modules in scope")
+    p.add_argument("--invariants", help="init: model.md (or any file) with `- I1: …` invariant lines")
+    p.add_argument("--rows", help="set: row ids, e.g. E001,E004-E010,I2")
+    p.add_argument("--match", help="set: glob or substring on route/location (invariants: on the text)")
+    p.add_argument("--kind", choices=["http", "webhook", "action", "schedule", "event", "queue"])
+    p.add_argument("--group", choices=["permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"])
+    p.add_argument("--axis", help=f"set: {','.join(COVERAGE_AXES)} or all (default all)")
+    p.add_argument("--checked", help="set: evidence reference (file, test, hypothesis id)")
+    p.add_argument("--out-of-scope", help="set: reason")
+    p.add_argument("--not-done", help="set: reason")
+    p.add_argument("--only-blank", action="store_true", help="set: leave filled cells alone")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_coverage)
+
+    p = sub.add_parser("seed", help="list|apply|run planted-defect tests (miss rate) on throwaway copies")
+    p.add_argument("action", choices=["list", "apply", "run"])
+    p.add_argument("--project")
+    p.add_argument("--repo", help="client repo (read only; copies come from git archive)")
+    p.add_argument("--scope", nargs="+")
+    p.add_argument("--commit", help="commit to copy (default HEAD)")
+    p.add_argument("--ops", help="comma-separated operators (default all)")
+    p.add_argument("--sites", action="store_true", help="list: print every site")
+    p.add_argument("--site", help="apply: site numbers from `list --sites`")
+    p.add_argument("--seeds", type=int, help="apply: random sites in one copy (default 1); run: copies (default 5)")
+    p.add_argument("--rng-seed", type=int, default=0, help="site sampling seed (default 0)")
+    p.add_argument("--out", help="apply: copy folder (default $QA_EVAL_DIR/w-<random>)")
+    p.add_argument("--feature")
+    p.add_argument("--timeout", type=int, default=30, help="run: minutes per copy")
+    p.add_argument("--model")
+    p.add_argument("--max-budget", type=float)
+    p.add_argument("--no-patterns", action="store_true")
+    p.add_argument("--keep", action="store_true", help="keep copies (and, on --dry-run, the manifest)")
+    p.add_argument("--dry-run", action="store_true", help="run: make the copies, print prompt and command only")
+    p.set_defaults(fn=cmd_seed)
+
+    p = sub.add_parser("rederive", help="blind re-run of a finished run, compared with its findings")
+    p.add_argument("--project", required=True)
+    p.add_argument("--run", required=True)
+    p.add_argument("--repo")
+    p.add_argument("--commit", help="override the run's recorded commit")
+    p.add_argument("--scope", nargs="+", help="override the run's recorded scope paths")
+    p.add_argument("--feature")
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--model")
+    p.add_argument("--max-budget", type=float)
+    p.add_argument("--no-patterns", action="store_true")
+    p.add_argument("--keep", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="prepare snapshot and hidden pattern dir, print only")
+    p.set_defaults(fn=cmd_rederive)
+
     p = sub.add_parser("sync", help="commit, pull --rebase and push the knowledge repo")
     p.add_argument("-m", "--message")
     p.add_argument("--no-push", action="store_true")
@@ -2647,7 +4131,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "finding" and args.action == "add" and not args.title:
         die("finding add needs --title, --severity and --evidence")
-    if args.cmd == "finding" and args.action in ("add", "review", "judge", "applied") and not args.run:
+    if args.cmd == "finding" and args.action in ("add", "review", "judge", "applied", "scope") and not args.run:
         die(f"finding {args.action} needs --run")
     if args.cmd == "finding" and args.action in ("review", "judge") and not args.finding:
         die(f"finding {args.action} needs --finding")

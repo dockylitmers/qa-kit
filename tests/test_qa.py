@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -610,6 +611,325 @@ class DoctorAndEvalReportTests(unittest.TestCase):
         self.assertEqual(qa.insert_under_heading(t, "A", "- two"), "# T\n\n## A\n\n- one\n- two\n\n## B\n")
         self.assertEqual(qa.insert_under_heading(t, "B", "- x"), "# T\n\n## A\n\n- one\n\n## B\n\n- x\n")
         self.assertEqual(qa.insert_under_heading(t, "C", "- y"), t + "\n## C\n\n- y\n")
+
+
+CONTROLLER = """import { Controller, Get, Post, Delete, UseGuards } from '@nestjs/common';
+import { ORDERS_ROUTE } from './routes';
+
+// @Post('commented-out') must not count
+@ApiTags('Admin Orders')
+@Controller('admin/orders')
+export class AdminOrdersController {
+  constructor(private readonly svc: Svc, @Inject(TOKEN) private readonly t: T) {}
+
+  @Get()
+  @Permissions('orders.read')
+  list(@Query() q: Q) {
+    return this.svc.list(q);
+  }
+
+  @Post(':orderNumber/refund')
+  @Permissions('orders.refund')
+  @ApiOperation({ summary: 'Refund (an order)' })
+  async refund(
+    @Param('orderNumber') n: string,
+    @Body() dto: RefundDto,
+  ) {
+    return this.svc.refund(n, dto);
+  }
+
+  @Get('export')
+  @Permissions('orders.read')
+  async export(@Query() q: Q) {
+    return this.svc.export(q);
+  }
+}
+
+@Controller(ORDERS_ROUTE)
+@UseGuards(GiftsEnabledGuard)
+export class MyOrdersController {
+  @Public()
+  @Post('webhook')
+  receive(@Body() b: unknown) {
+    return b;
+  }
+
+  @Delete(':id')
+  remove(@Param('id') id: string) {
+    return id;
+  }
+}
+"""
+
+JOBS = """import { Cron } from '@nestjs/schedule';
+export class ExpiryJob implements OnModuleInit {
+  onModuleInit() {
+    this.timer = setInterval(() => void this.expireDue(), 60_000);
+  }
+
+  @Cron('0 * * * *')
+  async hourly() {}
+
+  @OnEvent(GRADE_CHANGED, { async: true })
+  async onGradeChanged(e: E) {}
+}
+"""
+
+SERVICE = """export class OrdersService {
+  async refund(userId: string, orderNumber: string) {
+    const existing = await this.prisma.refund.findFirst({ where: { orderNumber } });
+    if (existing) {
+      throw new ConflictException('already refunded');
+    }
+    const order = await this.prisma.order.findFirst({
+      where: {
+        orderNumber,
+        userId,
+      },
+    });
+    await this.prisma.$transaction(async (tx) => {
+      const payment = await tx.payment.findUnique({ where: { orderId: order.id } });
+      await tx.order.updateMany({
+        where: { id: order.id, status: 'PAID' },
+        data: { status: 'REFUNDED' },
+      });
+    });
+    await this.auditLog.record({ action: 'order.refunded', orderNumber });
+    return order;
+  }
+}
+"""
+
+
+def make_repo(root: Path) -> Path:
+    repo = root / "repo"
+    files = {
+        "apps/server/src/orders/orders.controller.ts": CONTROLLER,
+        "apps/server/src/orders/routes.ts": "export const ORDERS_ROUTE = 'me/orders';\n",
+        "apps/server/src/orders/orders.controller.spec.ts": "@Controller('spec')\nclass X { @Post() a() {} }\n",
+        "apps/server/src/jobs/expiry.job.ts": JOBS,
+        "apps/server/src/orders/orders.service.ts": SERVICE,
+        "apps/server/src/seed/seed-users.ts": SERVICE,
+        "apps/web/app/(shop)/api/pay/webhook/route.ts": "export async function POST(req: Request) {\n  return ok();\n}\n",
+        "apps/web/app/api/me/route.ts": "export const GET = async () => {\n  const s = await auth();\n};\n",
+        "apps/web/lib/actions.ts": "'use server';\n\nexport async function saveProfile(f: FormData) {}\n",
+    }
+    for rel_path, text in files.items():
+        f = repo / rel_path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+    for cmd in (["git", "init", "-q"], ["git", "add", "-A"], ["git", "commit", "-q", "--no-gpg-sign", "-m", "init"]):
+        subprocess.run(cmd, cwd=repo, env=env, check=True, capture_output=True)
+    return repo
+
+
+class RecallCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.kb = make_kb(self.root)
+        self.repo = make_repo(self.root)
+        self.env = dict(os.environ, QA_EVAL_DIR=str(self.root / "eval"), QA_WORK=str(self.root / "work"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_entry_points_prefix_method_and_guards(self):
+        rows, notes = qa.extract_entry_points(self.repo, ["apps/server/src", "apps/web"])
+        by = {(r["method"], r["route"]): r for r in rows}
+        refund = by[("POST", "/admin/orders/:orderNumber/refund")]
+        self.assertEqual(refund["auth"], "Permissions(orders.refund)")
+        self.assertEqual(refund["location"], "apps/server/src/orders/orders.controller.ts:19")
+        self.assertIn(("GET", "/admin/orders"), by)
+        self.assertIn(("GET", "/admin/orders/export"), by)  # a method may be called `export`
+        hook = by[("POST", "/me/orders/webhook")]  # controller prefix from a constant in another file
+        self.assertEqual((hook["kind"], hook["auth"]), ("webhook", "UseGuards(GiftsEnabledGuard), public"))
+        self.assertEqual(by[("DELETE", "/me/orders/:id")]["auth"], "UseGuards(GiftsEnabledGuard)")
+        self.assertNotIn(("POST", "/spec"), by)  # tests are not entry points
+        self.assertFalse(any("commented-out" in r["route"] for r in rows))
+        kinds = {(r["kind"], r["route"]) for r in rows}
+        self.assertIn(("schedule", "ExpiryJob.expireDue [setInterval]"), kinds)
+        self.assertIn(("schedule", "ExpiryJob.hourly [0 * * * *]"), kinds)
+        self.assertIn(("event", "ExpiryJob.onGradeChanged [GRADE_CHANGED,{async:true}]"), kinds)
+        self.assertEqual(by[("POST", "/api/pay/webhook")]["kind"], "webhook")  # route group dropped
+        self.assertEqual(by[("GET", "/api/me")]["auth"], "session")
+        self.assertIn(("action", "apps/web/lib/actions.ts#saveProfile"), kinds)
+        self.assertEqual(notes, [])
+        # permission-guarded = permission decorator or auth guard; a feature-flag guard does not count
+        groups = {(r["method"], r["route"]): qa.entry_group(r) for r in rows}
+        self.assertEqual(groups[("POST", "/admin/orders/:orderNumber/refund")], "permission-guarded writes")
+        self.assertEqual(groups[("DELETE", "/me/orders/:id")], "other writes")
+
+    def test_coverage_check_fails_on_blank_cells(self):
+        cov = self.root / "cov.md"
+        model = self.root / "model.md"
+        model.write_text("### 불변식\n- I1: 주문당 환불 합계 ≤ 결제액\n- I2: 역할 변경은 15분 안에 적용\n")
+        code, out = cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo),
+                            "--scope", "apps/server/src/orders", "--file", str(cov), "--invariants", str(model))
+        self.assertEqual(code, 0, out)
+        self.assertIn("5 entry points", out)
+        self.assertIn("2 invariants", out)
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 1, out)
+        self.assertIn("E001 authz: blank", out)
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--match", "*refund*", "--axis", "dup,conc",
+                "--checked", "evidence/H1/refund.test.ts")
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--group", "permission-guarded writes",
+                "--only-blank", "--not-done", "no time")
+        code, out = cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--rows", "E001-E005,I1",
+                            "--only-blank", "--out-of-scope", "not in this run")
+        self.assertEqual(code, 0, out)
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 1, out)  # I2 still blank
+        self.assertIn("I2 check: blank", out)
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--rows", "I2", "--not-done", "no account")
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 0, out)
+        # a row with any not_done axis counts as not_done, even when other axes are checked
+        self.assertIn("permission-guarded write entry points 1: checked 0, out_of_scope 0, not_done 1", out)
+        self.assertIn("dup    checked 1, out_of_scope 4, not_done 0", out)
+        self.assertIn("invariants 2: checked 0, out_of_scope 1, not_done 1", out)
+        # a cell without a reason is not filled
+        cov.write_text(cov.read_text().replace("out_of_scope: not in this run", "out_of_scope:", 1))
+        self.assertEqual(cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))[0], 1)
+        # re-init keeps filled cells and ids
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--rows", "E001", "--axis", "authz",
+                "--out-of-scope", "read only")
+        before = qa.read_coverage(cov)[1]
+        cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo), "--scope", "apps/server/src/orders",
+                "--file", str(cov))
+        after = qa.read_coverage(cov)[1]
+        self.assertEqual([(r["id"], r["route"], r["authz"]) for r in before],
+                         [(r["id"], r["route"], r["authz"]) for r in after])
+
+    def test_seed_sites_per_operator(self):
+        sites = qa.seed_sites(self.repo, ["apps/server/src"])
+        ops = {s["op"] for s in sites}
+        self.assertEqual(ops, set(qa.SEED_OPS))
+        self.assertFalse(any("seed/" in s["file"] for s in sites))  # dev-only seeding code is skipped
+        text = (self.repo / "apps/server/src/orders/orders.service.ts").read_text()
+
+        def planted(op):
+            s = next(x for x in sites if x["op"] == op)
+            return text[:s["start"]] + s["new"] + text[s["end"]:]
+
+        self.assertNotIn("if (existing)", planted("drop-idempotency-check"))
+        self.assertIn("where: {\n        orderNumber,\n      },", planted("drop-owner-condition"))
+        self.assertIn("where: { id: order.id },", planted("unconditional-state-update"))
+        self.assertNotIn("auditLog.record", planted("drop-audit-call"))
+        self.assertIn("await this.prisma.payment.findUnique", planted("read-outside-transaction"))
+        authz = next(x for x in sites if x["op"] == "drop-authz-decorator")
+        self.assertEqual((authz["function"], authz["before"].strip()), ("refund", "@Permissions('orders.refund')"))
+
+    def test_seed_apply_changes_only_the_copy(self):
+        ctrl = self.repo / "apps/server/src/orders/orders.controller.ts"
+        before = ctrl.read_text()
+        out_dir = self.root / "copy"
+        code, out = cli_env(self.kb, self.env, "seed", "apply", "--repo", str(self.repo), "--scope",
+                            "apps/server/src/orders", "--ops", "drop-authz-decorator", "--out", str(out_dir))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ctrl.read_text(), before)
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertEqual(st, "")
+        copy = (out_dir / "apps/server/src/orders/orders.controller.ts").read_text()
+        self.assertNotIn("@Permissions('orders.refund')", copy)
+        # the copy has one commit and a clean tree: the planted change is invisible to git
+        log = subprocess.run(["git", "log", "--oneline"], cwd=out_dir, capture_output=True, text=True).stdout
+        self.assertEqual(len(log.splitlines()), 1)
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain"], cwd=out_dir, capture_output=True,
+                                        text=True).stdout, "")
+        manifests = list((self.root / "eval" / "manifests").glob("seed-*.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertNotIn(str(out_dir), str(manifests[0].parent))
+
+    def test_seed_run_dry_run_never_calls_claude(self):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        trap = bin_dir / "claude"
+        trap.write_text(f"#!/bin/sh\ntouch {self.root}/claude-called\n")
+        trap.chmod(0o755)
+        env = dict(self.env, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        cli(self.kb, "init", "demo")
+        code, out = cli_env(self.kb, env, "seed", "run", "--project", "demo", "--repo", str(self.repo),
+                            "--scope", "apps/server/src", "--seeds", "3", "--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("(hidden from the prompt)"), 3)
+        prompt = out.split("--- prompt")[1]
+        for op in qa.SEED_OPS:
+            self.assertNotIn(op, prompt)
+        self.assertIn("Location: <path>:<line>", prompt)
+        self.assertFalse((self.root / "claude-called").exists())
+        self.assertEqual([p.name for p in (self.root / "eval").iterdir() if p.name.startswith("w-")], [])
+        self.assertFalse((self.kb / "evals/demo/seed-results").exists())
+
+    def test_grade_seed(self):
+        site = {"op": "drop-audit-call", "file": "src/orders/orders.service.ts", "line": 40, "function": "refund"}
+        self.assertEqual(qa.grade_seed("1. Refund leaves no audit record\nLocation: src/orders/orders.service.ts:44",
+                                       site), "found")
+        self.assertEqual(qa.grade_seed("Location: src/orders/orders.service.ts:44 — double refund", site), "partial")
+        self.assertEqual(qa.grade_seed("audit missing in orders.service.ts", site), "partial")
+        self.assertEqual(qa.grade_seed("Location: src/other/orders.service.ts:40 audit", site), "missed")
+        self.assertEqual(qa.grade_seed("nothing here", site), "missed")
+
+    def test_rederive_hides_findings_and_derived_patterns(self):
+        kb = self.kb
+        cli(kb, "init", "demo")
+        for pid in ("PAT-old", "PAT-new"):
+            cli(kb, "pattern", "new", pid, "--title", pid)
+        old = kb / "patterns/PAT-old.md"
+        old.write_text(old.read_text() + "\nSee also PAT-new.\n")
+        (kb / "proposals/2026-10-21-retro.md").write_text(
+            "# Proposal\n\n## P1 — attribute\n\n```qa-apply\nop: attribute\ndecision: approved\n```\n\n"
+            "## P2 — new-pattern\n\n```qa-apply\nop: new-pattern\ndecision: approved\n```\n")
+        run_id = "2026-10-20-refunds"
+        title = "Refund double-pays when the webhook retries"
+        code, out = cli(kb, "finding", "add", "--project", "demo", "--run", run_id, "--title", title,
+                        "--severity", "high", "--evidence", "L1", "--location",
+                        "apps/server/src/orders/orders.service.ts:5", *FINDING_CONTEXT)
+        self.assertEqual(code, 0, out)
+        lf = kb / "projects/demo/runs" / run_id / "findings.jsonl"
+        with lf.open("a") as fh:
+            for item, pid in (("P1", "PAT-old"), ("P2", "PAT-new")):
+                fh.write(json.dumps({"type": "attribution", "finding": "F001", "patterns": [pid],
+                                     "source": f"2026-10-21-retro.md#{item}", "at": "2026-10-21T10:00:00+09:00"}) + "\n")
+        self.assertEqual(qa.rederive_hidden_patterns(kb, lf, run_id), ["PAT-new"])
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True,
+                                text=True).stdout.strip()
+        code, out = cli(kb, "finding", "scope", "--project", "demo", "--run", run_id, "--commit", commit,
+                        "--paths", "apps/server/src/orders")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cli(kb, "check")[0], 0)
+        code, out = cli_env(kb, self.env, "rederive", "--project", "demo", "--run", run_id, "--repo", str(self.repo),
+                            "--dry-run", "--keep")
+        self.assertEqual(code, 0, out)
+        self.assertIn("hidden as derived from this run: PAT-new)", out)
+        self.assertIn("original findings hidden from the agent: 1 (F001)", out)
+        prompt = out.split("--- prompt ---")[1].split("\n---\n")[0]
+        for leak in (title, run_id, "PAT-new", "qa-knowledge", str(kb)):
+            self.assertNotIn(leak, prompt)
+        self.assertIn("apps/server/src/orders", prompt)
+        stage = Path(re.search(r"pattern dir: (\S+)", out).group(1))
+        self.assertEqual(sorted(f.name for f in (stage / "patterns").iterdir()), ["PAT-old.md"])
+        staged = "\n".join(f.read_text() for f in stage.rglob("*.md"))
+        self.assertNotIn("PAT-new", staged)  # a shown pattern's mention of a hidden one is redacted
+        snap = Path(re.search(r"snapshot: (\S+)", out).group(1))
+        self.assertTrue((snap / "apps/server/src/orders/orders.service.ts").exists())
+        self.assertFalse(any(title in f.read_text(errors="ignore") for f in snap.rglob("*.ts")))
+        self.assertIn(title, re.search(r"transcript check would search for: (.*)", out).group(1))
+
+    def test_rederive_compare(self):
+        state = {"F001": {"finding": {"title": "t1", "severity": "high", "location": "src/a.ts:10"},
+                          "judgment": {"verdict": "accepted", "severity": "medium"}},
+                 "F002": {"finding": {"title": "t2", "severity": "low", "location": "src/b.ts:99"},
+                          "judgment": None}}
+        out = ("1. Lost refund\nLocation: src/a.ts:14\n\n2. New race\nLocation: src/c.ts:5\n"
+               "Location: src/c.ts:40\n")
+        orig, new, cands = qa.rederive_compare(state, out)
+        self.assertEqual([(o["id"], o["auto"]) for o in orig], [("F001", "yes"), ("F002", "no")])
+        self.assertEqual(len(cands), 2)
+        self.assertEqual([(c["title"], c["locs"]) for c in new], [("2. New race", [("src/c.ts", 5), ("src/c.ts", 40)])])
 
 
 if __name__ == "__main__":

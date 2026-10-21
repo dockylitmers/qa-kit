@@ -4,12 +4,12 @@
 
 | 구성 | 하는 일 |
 |---|---|
-| `skills/qa-run` | 절차: 0 모드 선택(코드만·기기만·둘 다, 대화형에서만 묻고 헤드리스는 코드) + 안전 계약 → 1 정찰 → 2 기능 재설계(장애 설계 카드) → 3 위험 분석 → 4 전파 추적 → 5 가설 순위 → 6 증명 L0–L5·LD(기기 재현) → 7 반박 검증 두 번(실행 중 건별 + 보고 직전 새 컨텍스트 건별) → 8 기존 이슈·결정 검색 + 결함 카드 보고 → 9 회고 기록 |
+| `skills/qa-run` | 절차: 0 모드 선택(코드만·기기만·둘 다, 대화형에서만 묻고 헤드리스는 코드) + 안전 계약 + 커버리지 표(스크립트가 만든 진입점 × 점검 축) → 1 정찰 → 2 기능 재설계(장애 설계 카드) → 3 위험 분석 → 4 전파 추적 → 5 가설 순위 → 6 증명 L0–L5·LD(기기 재현) → 7 반박 검증 두 번(실행 중 건별 + 보고 직전 새 컨텍스트 건별) → 8 커버리지 관문(빈칸이면 보고 불통과) + 기존 이슈·결정 검색 + 결함 카드 보고 → 9 회고 기록 |
 | `skills/device-qa` | 기기 재현 도구(qa-run 6단계 `LD`): iOS 시뮬레이터·Android 에뮬레이터를 잠금·실제 터치 판정·캡처·녹화·권한 팝업 처리로 조작(`scripts/device_qa.py`), 기기 경계 대입표, 실기기는 Appium 직접 |
 | `skills/qa-retro` | 회고(수동 전용): 판정·반박된 가설·놓친 결함(`misses`)에서 패턴 변경을 항목 단위로 `proposals/`에 제안 |
 | `agents/qa-breaker` | 공격·증명(1–6단계). 외부 발송 도구 없음, 지식 저장소에 쓰지 않음, `qa-run` 미리 로드. 후보마다 환경 가정·현실 빈도·심각도 근거 필수 |
 | `agents/qa-skeptic` | 반박 검증(7단계). **결함 하나당 한 번** 불러 "사실이 아님"을 증명하려고 시도하고 빈도·선행 조건으로 심각도를 다시 잰다 |
-| `bin/qa` | CLI(Python 표준 라이브러리만): 설치·대상 레포 환경 검사, 형식 검사, 패턴, 실행 기록·반박·판정·통계, 심각도 보정, 제안 반영, 기존 이슈 검색, 놓친 결함 수집, 재현 평가, 동기화 |
+| `bin/qa` | CLI(Python 표준 라이브러리만): 설치·대상 레포 환경 검사, 형식 검사, 패턴, 실행 기록·반박·판정·통계, 심각도 보정, 제안 반영, 기존 이슈 검색, 놓친 결함 수집, 재현 평가, 놓침 검사(커버리지 표·심은 결함·블라인드 재도출), 동기화 |
 | `install.sh` | 사용자 범위 설치(심볼릭 링크 + `~/.claude/settings.json`의 `env.QA_KB`) |
 
 MCP 서버는 없다. 지식은 git 파일로 쌓고, LLM은 내용만 쓰고, 형식 검사·병합·통계는 CLI가 한다.
@@ -164,6 +164,49 @@ qa eval audit [--project <p>]                      # 사례 linked_patterns 점�
 - 결과는 `evals/<project>/results/<case>-<시각>.md`. v0 채점은 기대(위치·증상)와 에이전트 출력을 나란히 두고 사람이 표시한다.
 - 레포 위치: `--repo`, `QA_REPO_<PROJECT>` 환경 변수, 또는 `projects/<project>/project.yaml`의 `repo_paths`.
 
+### 놓침 검사(재현율)
+
+반박(`qa-skeptic`)은 찾은 결함이 맞는지(정밀도)만 본다. 놓친 것은 세 장치로 본다.
+
+**1. 커버리지 표 — 매 실행, 보고 관문**
+
+```sh
+qa coverage init --project <p> --run <run> --repo <레포> --scope <경로 …> [--invariants <실행 폴더>/model.md]
+qa coverage set  --project <p> --run <run> --rows E012,E020-E031 --axis conc,dup --checked "H3 evidence/H3/"
+qa coverage set  --project <p> --run <run> --group "reads" --only-blank --out-of-scope "읽기 전용, 이번 범위는 쓰기"
+qa coverage check --project <p> --run <run> [--json]     # 빈칸·형식 오류가 있으면 종료 코드 1
+```
+
+- 표 파일: `${QA_WORK:-~/.qa-work}/<project>/<run>/coverage.md`(고객 레포 밖, `--file`로 바꿀 수 있음). 레포는 읽기만 한다.
+- 행은 코드에서 기계적으로 뽑는다: NestJS `@Controller` 접두사 + `@Get/@Post/@Put/@Patch/@Delete`(경로 상수는 레포 안 `const`에서 풂), 권한 데코레이터·가드(`@Permissions`, `@Roles`, `@UseGuards(…)`, `@Public`), 웹훅(경로·이름에 webhook·callback), `@Cron/@Interval/@Timeout`·`setInterval`·cron 라이브러리, `@OnEvent`, 큐(`@Processor`/`@Process`, `@EventPattern` …), Next.js `app/**/route.ts`·`pages/api`·`'use server'` 파일. 앱 전역 가드(`APP_GUARD`)와 경로 접두사는 머리말에 적힌다. 경로를 풀 수 없으면 `<dynamic:…>` 행과 경고가 나온다(손으로 고친다).
+- 열은 점검 축 6개: `authz`(인가·객체 소유) · `dup`(재시도·더블 제출·멱등) · `conc`(경합·잠금·여러 탭·여러 인스턴스) · `abort`(부분 실패·외부 실패·시간 초과·종료) · `input`(경계·형식) · `audit`(기록·로그). 불변식 행은 `- I1: …` 줄에서 만든다(칸 하나).
+- 칸 값은 `checked: <증거 참조>` / `out_of_scope: <이유>` / `not_done: <이유>` 중 하나. `init`을 다시 돌려도 채운 칸과 행 id는 남는다.
+- `check`는 분모(진입점 수·불변식 수)와 상태별 개수(행·축별)를 출력하고, 보고서 맨 위에 옮길 `report header` 줄을 준다. 행 상태: 축 하나라도 `not_done`이면 `not_done`, 아니면 하나라도 `checked`면 `checked`, 나머지는 `out_of_scope`. "권한 걸린 쓰기"는 권한·역할 데코레이터나 인증류 가드가 붙은 쓰기(기능 스위치 가드는 제외).
+
+**2. 심은 결함 시험 — 키트의 놓침률(정기)**
+
+```sh
+qa seed list [--repo <레포> --scope <경로 …> [--sites]]       # 연산자 목록 / 범위 안 심을 자리 수
+qa seed apply --repo <레포> --scope <경로 …> [--ops <op>] [--site 3 | --seeds 2] [--out <폴더>]
+qa seed run --project <p> --repo <레포> --scope <경로 …> --seeds 10 [--rng-seed 0] [--dry-run]
+```
+
+- 연산자: `drop-authz-decorator`(쓰기 진입점의 권한 데코레이터·가드 제거) · `drop-owner-condition`(조회 조건의 userId·memberId 등 소유 조건 제거) · `drop-idempotency-check`(`if (existing…) throw/return` 제거) · `unconditional-state-update`(update where의 상태 조건 제거) · `drop-audit-call`(감사 기록 호출 제거) · `read-outside-transaction`(트랜잭션 안 읽기를 트랜잭션 밖 클라이언트로). 시드·픽스처·마이그레이션·스크립트 폴더에는 심지 않는다.
+- 복사본은 `git archive`(이력 없음)로 만들고, 결함을 심은 **뒤에** `git init`·커밋한다 — `git diff`·이력에 흔적이 없다. 원래 레포는 읽기만 한다.
+- 심은 위치·종류는 `$QA_EVAL_DIR/manifests/`(복사본·지식 저장소 밖, 에이전트에 주지 않는 경로)에만 적는다. 프롬프트는 범위만이고 모든 복사본에 같다. transcript에 연산자 이름·manifest 경로가 나오면 그 실행은 무효.
+- `run`: 복사본마다 헤드리스 qa-breaker(`qa eval run`과 같은 격리), 출력의 `Location: <path>:<line>`과 증상 낱말로 찾음·부분·놓침을 자동 채점(사람 칸 따로), 연산자별 놓침률 표를 `evals/<project>/seed-results/`에 쓴다. `--dry-run`은 복사본을 만들고 프롬프트·명령만 보인 뒤 지운다(`claude -p`를 부르지 않음).
+
+**3. 블라인드 재도출 — 끝난 실행 재검증**
+
+```sh
+qa rederive --project <p> --run <run> [--repo <레포>] [--commit <sha> --scope <경로 …>] [--dry-run]
+```
+
+- 실행 기록의 범위·커밋(`qa finding scope`로 기록, 없으면 `--commit`·`--scope`)만으로 새 헤드리스 실행을 만든다. 원래 결함·판정·반박·보고서는 주지 않는다.
+- 그 실행에서 생긴 패턴(실행 기록의 `attribution` 중 제안 항목이 `new-pattern`인 것)을 숨긴다. 이미 있던 패턴에 통계만 귀속한 것은 보인다. 보이는 패턴 본문에 숨긴 패턴 ID가 있으면 `PAT-hidden`으로 바꾼다(leave-one-out과 같은 방식, `qa eval run`에도 적용).
+- transcript 검사: 실행 id, 원래 결함 제목, 숨긴 패턴 ID, `findings.jsonl`, 지식 저장소 경로가 나오면 무효.
+- 끝나면 `projects/<p>/runs/<run>/rederive-<시각>.md`에 '원래 결함 → 다시 찾았나'와 '블라인드만 찾음(원래 놓침?)' 표를 위치 기준 자동 대조 + 사람 칸으로 남긴다. `--dry-run`은 스냅샷·숨김 목록·프롬프트만 보인다.
+
 ### 검사와 동기화
 
 ```sh
@@ -188,7 +231,7 @@ qa doctor --offline --target <레포 경로>   # + 대상 레포가 요구하는
 7. **수명** — 오탐이 잦으면 probation → retired(지우지 않음), 오래 적중 없거나 프레임워크 major 변경이면 needs_revalidation.
 8. **공통 승격** — 2개 이상 프로젝트에서 채택 3건 이상 + `qa check` 통과 + 검토 + 확인 + 평가 통과.
 
-가장 값진 학습은 **놓친 결함**이다: 모델에 없던 진입점 / 빠진 안내어 / 증명 실패 / 판정 오류로 분류하고, 패턴·절차를 고치고, 그 결함을 평가 사례로 넣는다.
+놓친 것을 재는 장치: 매 실행의 커버리지 표(분모와 빈칸), 키트의 심은 결함 놓침률(`qa seed run`), 끝난 실행의 블라인드 재도출(`qa rederive`). 가장 값진 학습은 **놓친 결함**이다: 모델에 없던 진입점 / 빠진 안내어 / 증명 실패 / 판정 오류로 분류하고, 패턴·절차를 고치고, 그 결함을 평가 사례로 넣는다.
 
 ## 안전 규칙
 
@@ -206,6 +249,6 @@ qa doctor --offline --target <레포 경로>   # + 대상 레포가 요구하는
 ## 개발
 
 ```sh
-python3 tests/test_qa.py          # CLI 단위 시험(임시 지식 저장소에서)
+python3 -m unittest discover -s tests   # CLI 단위 시험(임시 지식 저장소·임시 git 레포에서, claude -p 호출 없음)
 claude plugin validate .
 ```

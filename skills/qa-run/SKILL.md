@@ -18,7 +18,7 @@ argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id
 | 역할 | 단계 | 쓸 수 있는 곳 |
 |---|---|---|
 | 호출한 세션(대화형 `/qa-run`) | 0, 7 호출(1차·2차), 8, 9 | 실행 폴더, `qa` CLI(9단계만), 이슈 트래커 **읽기**(8단계) |
-| `qa-breaker` 서브에이전트 | 1–6 | 실행 폴더만 |
+| `qa-breaker` 서브에이전트 | 1–6 | 실행 폴더만(`qa coverage set`으로 커버리지 표 칸 채우기 포함) |
 | `qa-skeptic` 서브에이전트 | 7 (결함 하나당 한 번 호출) | 읽기 + 테스트 실행 |
 
 - 네가 **호출한 세션**이면: 0단계를 하고, 1–6단계를 `qa-breaker`에게 맡기고(범위 파일 경로와 실행 폴더를 넘긴다), 결함 후보마다 `qa-skeptic`을 따로 불러 1차 반박을 받고, 보고 직전에 새 `qa-skeptic`으로 2차 반박을 다시 받은 뒤(7단계), 8–9단계를 한다.
@@ -43,6 +43,7 @@ argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id
 
 ```
 scope.md        0 안전 계약
+coverage.md     0 커버리지 표(진입점 × 점검 축, 2단계에서 불변식 행 추가) — 8단계 전 `qa coverage check` 통과 필수
 recon.md        1 정찰
 model.md        2 장애 설계 카드
 hazards.md      3 위험표
@@ -66,6 +67,11 @@ report.md       8 결함 카드 + 반박된 가설
 - 심각도 정의(기본값: [references/severity.md](references/severity.md))와 판정자.
 - 실행 환경 점검: `qa doctor --offline --target <레포 경로>`. 레포가 요구하는 도구(node·bun·docker·python 등)가 없다는 경고와 그 영향 문장(예: "이 환경에서는 L4 장애 주입 불가")을 그대로 적고, 증명 계획을 그에 맞춘다. 경고는 실패가 아니다.
 - 지식: `$QA_KB/INDEX.md`, 관련 패턴 파일, `$QA_KB/projects/<project>/notes.md`. 읽은 패턴 ID를 적는다(9단계 `applied`에 쓴다).
+- **커버리지 표(분모)**: 범위가 정해지면 스크립트로 표를 만든다. 사람·에이전트가 진입점 목록을 고르지 않는다.
+  ```sh
+  qa coverage init --project <p> --run <run-id> --repo <레포 경로> --scope <경로·모듈 …>   # → <실행 폴더>/coverage.md
+  ```
+  범위 안의 진입점(HTTP 라우트 — 컨트롤러 접두사 + 메서드, 권한 데코레이터·가드 표시 / 웹훅 / 예약 작업·타이머 / 이벤트 리스너 / 큐 소비자 / Next.js route handler·server action)이 행, 점검 축 6개가 열이다: `authz`(인가·객체 소유) · `dup`(재시도·더블 제출·멱등) · `conc`(경합·잠금·여러 탭·여러 인스턴스) · `abort`(부분 실패·외부 실패·시간 초과·종료) · `input`(경계·형식) · `audit`(기록·로그). 출력의 행 수(특히 권한 걸린 쓰기 진입점 수)를 `scope.md`에 적는다. 경고(`dynamic route`)가 나오면 그 행의 경로를 손으로 고친다. 범위가 너무 크면 범위를 줄이지 말고 칸을 `out_of_scope: <이유>`로 채운다 — 분모는 그대로 보인다.
 
 ## 1. 정찰
 
@@ -81,7 +87,7 @@ report.md       8 결함 카드 + 반박된 가설
 
 범위의 기능마다 카드를 쓴다(`model.md`, 틀: [references/design-card.md](references/design-card.md)).
 - 흐름(경계 표시), 상태 기계(무효 전이 포함), **불변식**(예: 주문당 성공 청구 ≤ 1, 발급은 결제당 1회, 환불 합계 ≤ 결제액, 권한 밖 데이터는 안 보임), 데이터 쓰기 지도(어느 경로가 어느 테이블·필드를 바꾸나), 되돌릴 수 없는 출구.
-- 불변식이 6단계 증명의 판정 기준이다. 먼저 적는다.
+- 불변식이 6단계 증명의 판정 기준이다. 먼저 적는다. 적은 뒤 `qa coverage init … --invariants <실행 폴더>/model.md`를 다시 돌려 불변식(`- I1: …` 줄)을 표의 행으로 붙인다(이미 채운 칸은 남는다). 세운 불변식은 점검하거나 `not_done: <이유>`로 남겨야 한다 — 목록에만 있고 아무 데로도 넘어가지 않는 불변식이 없게.
 
 ## 3. 위험 분석
 
@@ -134,6 +140,7 @@ report.md       8 결함 카드 + 반박된 가설
 - 증거는 `evidence/<가설 번호>/`에: 테스트 파일, 실행 명령, 출력(실패 확인), seed.
 - 기기 모드: 가설마다 [device-qa](../device-qa/SKILL.md) 2절 안전 규칙대로 잠그고, 5절 형식으로 `evidence/<가설>/device/`에 남긴다. 기기를 쓰는 동안 다른 증명과 기기를 나눠 쓰지 않는다(기기 하나에 owner 하나). 끝나면 `down`·`status []`, 바꾼 기기 설정 원상복구를 확인한다. both 모드에서 코드로 이미 L1인 가설은 사용자에게 보이는 실패가 다를 때만 기기에서도 재현한다.
 - 평가 모드에서는 L0까지만 한다.
+- **커버리지 칸 채우기**(평가 모드 제외): 1–6단계에서 본 칸마다 `qa coverage set --file <실행 폴더>/coverage.md --rows E012 --axis conc --checked "<증거: 가설 번호·evidence 경로·파일:줄>"`. 가설을 세웠지만 증명하지 못했으면 `--not-done "<이유>"`, 범위 밖이면 `--out-of-scope "<이유>"`(여러 행은 `--match`·`--group`·`--rows E001-E040`). **보지 않은 칸을 `checked`로 쓰지 않는다.** 위험표·확인 목록으로 넘긴 칸은 `checked`가 아니라 `not_done`이다.
 
 qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 한 줄 요약, 가설 문장, 심각도(제안), **환경 가정·현실 빈도·심각도 근거**, 증거 등급, 증거 위치, 쓴 패턴 ID, 반박될 수 있는 이유(스스로 생각한 것).
 
@@ -157,6 +164,17 @@ qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 
 
 `report.md`. 형식: [references/defect-card.md](references/defect-card.md).
 
+**커버리지 관문(필수, 보고 전):**
+
+```sh
+qa coverage check --project <p> --run <run-id>     # 빈칸·형식 오류가 하나라도 있으면 종료 코드 1
+```
+
+- 통과하지 못하면 보고서를 쓰지 않는다. 남은 빈칸을 채운다: 본 것은 `checked: <증거>`, 못 한 것은 `not_done: <이유>`, 범위 밖은 `out_of_scope: <이유>`. 빈칸을 없애려고 보지 않은 칸을 `checked`로 쓰지 않는다.
+- 행 상태 규칙: 축 하나라도 `not_done`이면 그 행은 `not_done`, 아니면 하나라도 `checked`면 `checked`, 나머지는 `out_of_scope`.
+- 출력의 `report header` 줄을 보고서 **맨 위**(결론 첫 줄)에 옮긴다. 예: "권한 걸린 쓰기 진입점 82개 중 checked 30, out_of_scope 40, not_done 12 · 전체 진입점 N개 중 … · 불변식 7개 중 checked 5, not_done 2". 이것이 이 보고가 전수 점검인지 아닌지를 말하는 숫자다.
+- `not_done` 칸은 보고서의 '확인 못 한 것'에 행 id와 이유로 모두 옮긴다(축별로 묶어도 된다).
+
 **먼저 기존 이슈·결정을 검색한다**(카드를 쓰기 전, 결함마다). 호출한 세션이 한다(읽기만).
 
 ```sh
@@ -169,11 +187,11 @@ qa issue search --project <p> <핵심어 2–4개>     # 트래커(닫힌 것 �
 - Jira 등 다른 트래커를 쓰는 프로젝트는 검색 명령을 `projects/<p>/project.yaml`의 `issue_tracker`에 둔다(README 참고). 설정이 없으면 보고서의 '확인 못 한 것'에 "기존 이슈 검색 안 함"으로 적는다.
 
 순서:
-1. 결론: 확인된 결함 n건(심각도별), 1차→2차 반박 집계(유지·하향·반박), 기존 결정 충돌 n건, 위험 상위 흐름 커버리지(분석 완료/미완).
+1. 결론: (맨 위) 커버리지 분모와 칸 상태 개수, 확인된 결함 n건(심각도별), 1차→2차 반박 집계(유지·하향·반박), 기존 결정 충돌 n건, 위험 상위 흐름 커버리지(분석 완료/미완).
 2. 결함 카드(GitHub 이슈 초안, 영어): 증상 중심 요약, 최소 재현, 기대(명세 근거)·실제, 환경·커밋, **환경 가정·현실 빈도**, 전파 경로(트리거 → 전파 → 영향), 심각도와 이유(1차 → 2차), 증거 등급과 증거, 두 반박 결과, 원인 추정과 확인 방법, 회귀 테스트 제안, Related. 한 카드에 결함 하나.
 3. 확인 요청 목록(가설 등급).
 4. 반박된 가설과 반박 근거(학습 재료).
-5. 확인 못 한 것(시간·환경·권한 때문에 못 본 곳).
+5. 확인 못 한 것(시간·환경·권한 때문에 못 본 곳) + 커버리지 표의 `not_done` 칸 전부.
 
 - 이슈를 게시하거나, 라벨·담당을 붙이거나, 메시지를 보내지 않는다. 초안만 만든다. 게시는 사람이 승인 묶음으로 한다.
 - **보안 취약점**은 이슈 초안에 넣지 않고 따로 표시해 사람에게 먼저 알린다.
@@ -184,6 +202,8 @@ qa issue search --project <p> <핵심어 2–4개>     # 트래커(닫힌 것 �
 지식 저장소에는 `qa` CLI로만 쓴다(형식 검사·통계는 CLI가 한다).
 
 ```sh
+qa finding scope --project <p> --run <run-id> --commit <읽은 커밋> --paths <a,b> \
+  --coverage "<qa coverage check의 report header 줄>"                    # 범위·커밋(블라인드 재도출에 쓰임)
 qa finding applied --project <p> --run <run-id> --patterns PAT-a,PAT-b     # 0단계에서 읽고 쓴 패턴
 qa finding add --project <p> --run <run-id> --title "<symptom summary>" \
   --severity high --evidence L1 --class error_propagation \
