@@ -4,12 +4,17 @@
 Python standard library only. The LLM writes content; this script does
 format checks, ledger writes, deterministic stats and eval plumbing.
 
-  qa doctor                     installation check (exit 1 on any failure)
+  qa doctor [--target <repo>]   installation check (exit 1 on any failure); --target adds
+                                a target-repo toolchain check (warnings only)
   qa init <project>             create projects/<project>/ and evals/<project>/
   qa check                      validate patterns, eval cases, run ledgers, leaks
   qa pattern list|show|new|index
-  qa finding add|judge|applied|list
-  qa eval list|run <case>
+  qa finding add|review|judge|applied|list
+  qa calibration add|list       severity calibration (finder -> refutations -> confirmed)
+  qa proposal show|decide|apply item-level knowledge changes, applied deterministically
+  qa issue search               existing issues and recorded won't-fix decisions
+  qa misses collect             bug issues since a date that no kit run reported
+  qa eval list|run|report|audit <case>
   qa sync                       pull/commit/push the knowledge repo
 """
 
@@ -22,6 +27,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -29,7 +35,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 KIT_DIR = Path(__file__).resolve().parent.parent
 HOME = Path(os.path.expanduser("~"))
 KB_REMOTE_SLUG = "dockylitmers/qa-knowledge"
@@ -42,7 +48,9 @@ PATTERN_TIER = {"global", "project"}
 FAILURE_CLASS = {"boundary", "sad_path", "error_propagation", "concurrency"}
 SEVERITY = {"critical", "high", "medium", "low"}
 VERDICTS = {"accepted", "false_positive", "wont_fix", "duplicate"}
+REVIEW_VERDICTS = {"refuted", "stands", "downgraded", "uncertain"}
 EVIDENCE_LEVELS = {"L0", "L1", "L2", "L3", "L4", "L5"}
+SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 PATTERN_REQUIRED = [
     "id", "status", "tier", "failure_class", "title", "scope", "probe", "oracle",
     "evidence_required", "false_positive_traps", "severity_prior", "stats",
@@ -51,7 +59,8 @@ PATTERN_REQUIRED = [
 STAT_KEYS = ["applied", "findings", "accepted", "false_positive", "wont_fix", "duplicate"]
 EVAL_REQUIRED = ["id", "pre_fix_commit", "scope", "failure_class", "expected_finding"]
 FP_TRAP_REQUIRED = ["id", "scope", "trap"]
-KB_DIRS = ["patterns", "projects", "evals", "evals/fp-traps", "inbox", "proposals"]
+KB_DIRS = ["patterns", "projects", "evals", "evals/fp-traps", "inbox", "proposals", "calibration"]
+CALIBRATION_FILE = "calibration/severity.jsonl"
 
 PATTERN_ID_RE = re.compile(r"^PAT-[A-Za-z0-9][A-Za-z0-9-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -368,8 +377,11 @@ def yaml_load(text: str):
     return _parse_block(lines, first[0])
 
 
-def yaml_flow(v) -> str:
-    """Serialise a value in YAML flow style (used for stats lines and templates)."""
+def yaml_flow(v, quote_items=False) -> str:
+    """Serialise a value in YAML flow style (stats lines, templates, proposal edits).
+
+    quote_items=True double-quotes every string inside lists, matching hand-written pattern files.
+    """
     if v is None:
         return "null"
     if v is True:
@@ -379,9 +391,10 @@ def yaml_flow(v) -> str:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
-        return "[" + ", ".join(yaml_flow(x) for x in v) + "]"
+        return "[" + ", ".join(json.dumps(x, ensure_ascii=False) if quote_items and isinstance(x, str)
+                               else yaml_flow(x, quote_items) for x in v) + "]"
     if isinstance(v, dict):
-        return "{" + ", ".join(f"{k}: {yaml_flow(x)}" for k, x in v.items()) + "}"
+        return "{" + ", ".join(f"{k}: {yaml_flow(x, quote_items)}" for k, x in v.items()) + "}"
     s = str(v)
     if s == "" or re.search(r"[:#,\[\]{}&*!|>'\"%@`]|^\s|\s$|^-", s) or _scalar(s) != s:
         return json.dumps(s, ensure_ascii=False)
@@ -552,7 +565,7 @@ def compute_stats(kb: Path):
 
     for lf in ledger_files(kb):
         run_key = str(lf.parent.relative_to(kb))
-        findings, judgments = {}, {}
+        findings, judgments, attributed = {}, {}, {}
         for _, ev in read_ledger(lf):
             t = ev.get("type")
             if t == "applied":
@@ -562,9 +575,13 @@ def compute_stats(kb: Path):
                 findings[ev["id"]] = ev
             elif t == "judgment":
                 judgments[ev["finding"]] = ev  # latest judgment wins
+            elif t == "attribution":
+                # Retro attribution: the finding counts towards the nearest existing pattern(s).
+                attributed.setdefault(ev["finding"], []).extend(ev.get("patterns", []))
         for fid, f in findings.items():
             j = judgments.get(fid)
-            for pid in f.get("patterns", []):
+            pids = list(dict.fromkeys(list(f.get("patterns", [])) + attributed.get(fid, [])))
+            for pid in pids:
                 b = bucket(pid)
                 b["runs"].add(run_key)
                 b["findings"] += 1
@@ -788,8 +805,9 @@ def check_eval(kb: Path, path: Path, errors, warnings, ids, pattern_ids):
             warnings.append(f"{where}: linked pattern {lp} not found")
 
 
-def check_ledger(kb: Path, lf: Path, errors):
+def check_ledger(kb: Path, lf: Path, errors, warnings=None, pattern_ids=None):
     where = rel(kb, lf)
+    warnings = warnings if warnings is not None else []
     seen = set()
     try:
         events = read_ledger(lf)
@@ -811,7 +829,21 @@ def check_ledger(kb: Path, lf: Path, errors):
                 errors.append(f"{where}:{n}: evidence '{ev.get('evidence')}' not in L0..L5")
             if ev.get("id") in seen:
                 errors.append(f"{where}:{n}: duplicate finding id {ev.get('id')}")
+            missing = [k for k in ("assumptions", "frequency", "severity_basis") if not ev.get(k)]
+            if missing:
+                warnings.append(f"{where}:{n}: finding {ev.get('id')} lacks {', '.join(missing)}")
             seen.add(ev.get("id"))
+        elif t == "review":
+            if ev.get("finding") not in seen:
+                errors.append(f"{where}:{n}: review for unknown finding {ev.get('finding')}")
+            if ev.get("round") not in (1, 2):
+                errors.append(f"{where}:{n}: review round must be 1 (in-run) or 2 (pre-report, fresh context)")
+            if ev.get("verdict") not in REVIEW_VERDICTS:
+                errors.append(f"{where}:{n}: review verdict '{ev.get('verdict')}' not in {sorted(REVIEW_VERDICTS)}")
+            if ev.get("severity") not in SEVERITY:
+                errors.append(f"{where}:{n}: review needs the severity after refutation")
+            if not ev.get("reason"):
+                errors.append(f"{where}:{n}: review needs a reason")
         elif t == "judgment":
             if ev.get("finding") not in seen:
                 errors.append(f"{where}:{n}: judgment for unknown finding {ev.get('finding')}")
@@ -821,8 +853,41 @@ def check_ledger(kb: Path, lf: Path, errors):
                 errors.append(f"{where}:{n}: judgment needs a reason")
             if ev.get("severity") not in SEVERITY:
                 errors.append(f"{where}:{n}: judgment needs a confirmed severity")
+            for k in ("issue", "related"):
+                if k in ev and not (isinstance(ev[k], list) and all(isinstance(x, int) for x in ev[k])):
+                    errors.append(f"{where}:{n}: judgment.{k} must be a list of issue numbers")
+        elif t == "attribution":
+            if ev.get("finding") not in seen:
+                errors.append(f"{where}:{n}: attribution for unknown finding {ev.get('finding')}")
+            if not isinstance(ev.get("patterns"), list) or not ev.get("patterns"):
+                errors.append(f"{where}:{n}: attribution.patterns must be a non-empty list")
+            elif pattern_ids is not None:
+                for pid in ev["patterns"]:
+                    if pid not in pattern_ids:
+                        errors.append(f"{where}:{n}: attribution to unknown pattern {pid}")
         else:
             errors.append(f"{where}:{n}: unknown event type '{t}'")
+
+
+def check_calibration(kb: Path, errors):
+    path = kb / CALIBRATION_FILE
+    if not path.exists():
+        return
+    where = rel(kb, path)
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as e:
+            errors.append(f"{where}:{n}: invalid JSON ({e})")
+            continue
+        for k in ("ref", "initial", "final", "reason"):
+            if not row.get(k):
+                errors.append(f"{where}:{n}: missing '{k}'")
+        for k in ("initial", "round1", "round2", "final"):
+            if row.get(k) is not None and row[k] not in SEVERITY:
+                errors.append(f"{where}:{n}: {k} '{row[k]}' not a severity")
 
 
 def run_check(kb: Path):
@@ -842,16 +907,19 @@ def run_check(kb: Path):
     for f in eval_case_files(kb):
         check_eval(kb, f, errors, warnings, case_ids, ids)
     for lf in ledger_files(kb):
-        check_ledger(kb, lf, errors)
+        check_ledger(kb, lf, errors, warnings, set(ids))
+    check_calibration(kb, errors)
+    audit_eval_links(kb, warnings)
 
-    # Global patterns and the global index: no client names, code paths or secrets.
+    # Global patterns, the global index and severity calibration: no client names, code paths or secrets.
     global_rules = [(f"denylist '{e}'", rx) for e, rx in deny] + PATH_RES
     targets = [p.path for p in pats if p.path.parent == kb / "patterns"]
-    if (kb / "INDEX.md").exists():
-        targets.append(kb / "INDEX.md")
+    for extra in ("INDEX.md", CALIBRATION_FILE):
+        if (kb / extra).exists():
+            targets.append(kb / extra)
     for t in targets:
         for n, label, hit in scan_text(t.read_text(encoding="utf-8"), global_rules):
-            errors.append(f"{rel(kb, t)}:{n}: {label} in global pattern: {hit!r}")
+            errors.append(f"{rel(kb, t)}:{n}: {label} in client-neutral file: {hit!r}")
     # Everywhere: no internal record IDs, no secrets.
     for f in iter_kb_text_files(kb):
         try:
@@ -942,10 +1010,102 @@ def cmd_doctor(args):
         report(not dirty, "knowledge repo clean",
                f"{len(dirty.splitlines())} uncommitted changes; `qa sync` when ready" if dirty else "", level="WARN")
     report(bool(shutil.which("claude")), "claude CLI", shutil.which("claude") or "not found (needed for qa eval run)", level="WARN")
-    report(bool(shutil.which("gh")), "gh CLI", shutil.which("gh") or "not found (needed to clone)", level="WARN")
+    report(bool(shutil.which("gh")), "gh CLI", shutil.which("gh") or "not found (needed to clone and read issues)", level="WARN")
     bad = results.count(False)
     print(f"qa doctor: {'all checks passed' if not bad else f'{bad} problem(s)'}")
+    if args.target:
+        target_warnings = doctor_target(Path(os.path.expanduser(args.target)))
+        print(f"qa doctor --target: {target_warnings} warning(s) (warnings do not fail the check)")
     return 1 if bad else 0
+
+
+# Target-repo toolchain: (tool, marker files, impact sentence when the tool is missing).
+TARGET_TOOLS = [
+    ("node", ["package.json"],
+     "L1·L2 실패 테스트(JS/TS)를 돌릴 수 없다 — 이 환경에서는 L0 코드 근거까지만 가능"),
+    ("bun", ["bun.lock", "bun.lockb", "bunfig.toml"],
+     "레포의 패키지 관리자·스크립트(bun)를 쓸 수 없다 — npm 등으로 설치하면 잠금 파일과 의존 판이 다를 수 있어 "
+     "기존 테스트 통과로 환경을 먼저 확인하고, `bun run`·`bun test` 스크립트는 풀어서 실행해야 한다"),
+    ("pnpm", ["pnpm-lock.yaml"], "레포 잠금 파일(pnpm)대로 설치할 수 없다 — 의존 판이 달라질 수 있다"),
+    ("yarn", ["yarn.lock"], "레포 잠금 파일(yarn)대로 설치할 수 없다 — 의존 판이 달라질 수 있다"),
+    ("docker", ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml", "Dockerfile"],
+     "이 환경에서는 L4 장애 주입 불가(Toxiproxy·DB·캐시 컨테이너) — 실DB 동시성·잠금 순서는 목 시뮬레이션(L1)으로 "
+     "대신하고 '실DB 미확인'을 환경 가정으로 적는다"),
+    ("python3", ["pyproject.toml", "requirements.txt", "Pipfile", "setup.py"],
+     "파이썬 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+    ("go", ["go.mod"], "Go 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+    ("cargo", ["Cargo.toml"], "Rust 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+    ("java", ["pom.xml", "build.gradle", "build.gradle.kts"], "JVM 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+    ("ruby", ["Gemfile"], "Ruby 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+    ("flutter", ["pubspec.yaml"], "Flutter·Dart 테스트를 돌릴 수 없다 — L0 코드 근거까지만 가능"),
+]
+TARGET_SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".next", ".turbo", "Pods", ".venv",
+                    "venv", "__pycache__", "coverage", ".expo", "target"}
+
+
+def scan_target_markers(repo: Path, max_depth=3):
+    """Relative paths of marker files up to max_depth below repo (read-only walk)."""
+    names = {m for _, ms, _ in TARGET_TOOLS for m in ms}
+    found = {}
+    base_depth = len(repo.parts)
+    for root, dirs, files in os.walk(repo):
+        depth = len(Path(root).parts) - base_depth
+        dirs[:] = [d for d in dirs if d not in TARGET_SKIP_DIRS and not (depth >= max_depth)]
+        for f in files:
+            key = "Dockerfile" if f.startswith("Dockerfile") else ("docker-compose.yml" if f.startswith("docker-compose") else f)
+            if key in names:
+                found.setdefault(key, []).append(str((Path(root) / f).relative_to(repo)))
+    return found
+
+
+def tool_version(tool: str) -> str:
+    try:
+        r = run([tool, "--version"], timeout=15)
+        return (r.stdout or r.stderr).strip().splitlines()[0][:60] if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return ""
+
+
+def doctor_target(repo: Path) -> int:
+    """Check what the target repo needs on this machine. Never writes to the repo."""
+    if not repo.is_dir():
+        print(f"[WARN] target {repo} — not a directory")
+        return 1
+    print(f"[ok  ] target {repo} (read-only scan)")
+    found = scan_target_markers(repo)
+    pkg = {}
+    if (repo / "package.json").exists():
+        try:
+            pkg = json.loads((repo / "package.json").read_text(encoding="utf-8"))
+        except ValueError:
+            pkg = {}
+    scripts = " ".join(str(v) for v in (pkg.get("scripts") or {}).values())
+    pm = str(pkg.get("packageManager") or "")
+    warnings = 0
+    for tool, markers, impact in TARGET_TOOLS:
+        why = [p for m in markers for p in found.get(m, [])]
+        if tool == "bun" and (pm.startswith("bun@") or re.search(r"(^|[\s;&])bunx?\s", scripts)):
+            why.append("package.json scripts/packageManager")
+        if tool in ("pnpm", "yarn") and pm.startswith(f"{tool}@"):
+            why.append("package.json packageManager")
+        if not why:
+            continue
+        exe = {"java": "java", "flutter": "flutter"}.get(tool, tool)
+        where = ", ".join(sorted(set(why))[:4]) + (" …" if len(set(why)) > 4 else "")
+        if shutil.which(exe):
+            print(f"[ok  ] {tool} — {tool_version(exe) or shutil.which(exe)} (needed by {where})")
+        else:
+            warnings += 1
+            print(f"[WARN] {tool} — not found (needed by {where})\n       impact: {impact}")
+    engines = (pkg.get("engines") or {}).get("node")
+    if engines and shutil.which("node"):
+        want = re.search(r"(\d+)", str(engines))
+        have = re.search(r"v?(\d+)", tool_version("node"))
+        if want and have and int(have.group(1)) < int(want.group(1)):
+            warnings += 1
+            print(f"[WARN] node version — have {have.group(0)}, package.json engines.node {engines}\n"
+                  "       impact: 설치·테스트가 판 차이로 실패할 수 있다")
+    return warnings
 
 
 # --------------------------------------------------------------------------
@@ -1115,20 +1275,84 @@ def append_event(path: Path, ev: dict):
         fh.write(json.dumps(ev, ensure_ascii=False, sort_keys=False) + "\n")
 
 
+def parse_issue_numbers(v):
+    out = []
+    for x in split_list(v):
+        x = x.lstrip("#")
+        if not x.isdigit():
+            die(f"issue numbers must be digits (got {x!r})")
+        out.append(int(x))
+    return out
+
+
+def ledger_state(lf: Path):
+    """Latest view of a ledger: {finding_id: {finding, reviews{round: ev}, judgment, attributed[]}}."""
+    state = {}
+    for _, ev in read_ledger(lf):
+        t = ev.get("type")
+        if t == "finding":
+            state[ev["id"]] = {"finding": ev, "reviews": {}, "judgment": None, "attributed": []}
+        elif t in ("review", "judgment", "attribution") and ev.get("finding") in state:
+            s = state[ev["finding"]]
+            if t == "review":
+                s["reviews"][ev.get("round")] = ev  # latest per round wins
+            elif t == "judgment":
+                s["judgment"] = ev
+            else:
+                s["attributed"] += [p for p in ev.get("patterns", []) if p not in s["attributed"]]
+    return state
+
+
+def find_finding(kb: Path, lf: Path, fid: str):
+    st = ledger_state(lf).get(fid)
+    if not st:
+        die(f"finding {fid} not in {rel(kb, lf)}")
+    return st
+
+
+def project_runs(kb: Path, project: str):
+    return sorted((kb / "projects" / project / "runs").glob("*/findings.jsonl"))
+
+
 def cmd_finding(args):
     kb = resolve_kb(args.kb)
     if args.action == "list":
+        lfs = [ledger_path(kb, args.project, args.run)] if args.run else project_runs(kb, args.project)
+        if not lfs:
+            die(f"no run ledgers for {args.project}")
+        n_find = n_judged = 0
+        for lf in lfs:
+            if not args.run:
+                print(f"# {lf.parent.name}")
+            for fid, s in ledger_state(lf).items():
+                f, j = s["finding"], s["judgment"]
+                n_find += 1
+                n_judged += bool(j)
+                rounds = " ".join(f"r{r}:{s['reviews'][r]['verdict']}({s['reviews'][r]['severity']})"
+                                  for r in sorted(s["reviews"]))
+                verdict = f"{j['verdict']} ({j['severity']})" if j else "untriaged"
+                issue = ",".join(f"#{x}" for x in (j or {}).get("issue", [])) or "-"
+                print(f"{fid}  {f['severity']:<8} {f['evidence']}  {rounds or '-':<36} {verdict:<24} {issue:<7} {f['title']}")
+        print(f"{n_find} findings, {n_judged} judged")
+        return 0
+
+    if args.action == "review":
+        if args.round not in (1, 2):
+            die("--round must be 1 (in-run refutation) or 2 (pre-report refutation in a fresh context)")
+        if args.verdict not in REVIEW_VERDICTS:
+            die(f"--verdict must be one of {sorted(REVIEW_VERDICTS)}")
+        if args.severity not in SEVERITY:
+            die(f"--severity (after refutation) must be one of {sorted(SEVERITY)}")
+        if not args.reason:
+            die("--reason is required")
         lf = ledger_path(kb, args.project, args.run)
-        findings, judgments = {}, {}
-        for _, ev in read_ledger(lf):
-            if ev["type"] == "finding":
-                findings[ev["id"]] = ev
-            elif ev["type"] == "judgment":
-                judgments[ev["finding"]] = ev
-        for fid, f in findings.items():
-            j = judgments.get(fid)
-            verdict = f"{j['verdict']} ({j['severity']})" if j else "untriaged"
-            print(f"{fid}  {f['severity']:<8} {f['evidence']}  {verdict:<24} {f['title']}")
+        find_finding(kb, lf, args.finding)
+        ev = {"type": "review", "finding": args.finding, "round": args.round, "verdict": args.verdict,
+              "severity": args.severity, "reason": args.reason, "corrections": args.corrections,
+              "frequency": args.frequency, "assumptions": args.assumption or None, "by": args.by,
+              "at": now_iso()}
+        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "", [])})
+        print(f"{args.finding}: round {args.round} {args.verdict} ({args.severity})")
         return 0
 
     patterns = split_list(getattr(args, "patterns", ""))
@@ -1149,13 +1373,17 @@ def cmd_finding(args):
             die(f"--severity must be one of {sorted(SEVERITY)}")
         if args.evidence not in EVIDENCE_LEVELS:
             die("--evidence must be one of L0..L5")
+        if not (args.assumption and args.frequency and args.severity_basis):
+            die("finding add needs --assumption (repeatable; 'none' if there is none), --frequency "
+                "and --severity-basis: severity is judged against realistic frequency and preconditions")
         lf = ledger_path(kb, args.project, args.run, create=True)
         existing = [ev for _, ev in read_ledger(lf) if ev.get("type") == "finding"]
         fid = f"F{len(existing) + 1:03d}"
         ev = {"type": "finding", "id": fid, "title": args.title, "severity": args.severity,
               "evidence": args.evidence, "failure_class": args.cls, "location": args.location,
               "patterns": patterns, "out_of_pattern": not patterns, "summary": args.summary,
-              "at": now_iso()}
+              "assumptions": args.assumption, "frequency": args.frequency,
+              "severity_basis": args.severity_basis, "at": now_iso()}
         append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
         refresh_stats(kb, set(patterns))
         print(f"{fid} added to {rel(kb, lf)}")
@@ -1169,20 +1397,660 @@ def cmd_finding(args):
         if not args.reason:
             die("--reason is required")
         lf = ledger_path(kb, args.project, args.run)
-        finding = None
-        for _, ev in read_ledger(lf):
-            if ev.get("type") == "finding" and ev.get("id") == args.finding:
-                finding = ev
-        if not finding:
-            die(f"finding {args.finding} not in {rel(kb, lf)}")
+        st = find_finding(kb, lf, args.finding)
         ev = {"type": "judgment", "finding": args.finding, "verdict": args.verdict,
               "reason": args.reason, "severity": args.severity, "by": args.by,
-              "duplicate_of": args.duplicate_of, "at": now_iso()}
-        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
-        changed = refresh_stats(kb, set(finding.get("patterns", [])))
+              "duplicate_of": args.duplicate_of, "issue": parse_issue_numbers(args.issue),
+              "related": parse_issue_numbers(args.related), "at": now_iso()}
+        append_event(lf, {k: v for k, v in ev.items() if v not in (None, "", [])})
+        changed = refresh_stats(kb, set(st["finding"].get("patterns", [])) | set(st["attributed"]))
         print(f"{args.finding}: {args.verdict}; stats updated: {', '.join(changed) or 'none'}")
         return 0
     die(f"unknown finding action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# qa calibration — finder severity vs refutations vs confirmed severity
+# --------------------------------------------------------------------------
+
+def calibration_ref(project: str, run_id: str, fid: str) -> str:
+    # Opaque reference: the calibration file is client-neutral, so no project or run names.
+    return hashlib.sha256(f"{project}/{run_id}/{fid}".encode()).hexdigest()[:12]
+
+
+def read_calibration(kb: Path):
+    path = kb / CALIBRATION_FILE
+    if not path.exists():
+        return []
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def neutral_hits(kb: Path, text: str):
+    deny, _ = load_denylist(kb)
+    return scan_text(text, [(f"denylist '{e}'", rx) for e, rx in deny] + PATH_RES + SECRET_RES
+                     + [("internal record id", INTERNAL_ID_RE)])
+
+
+def direction(a, b):
+    if a not in SEVERITY_RANK or b not in SEVERITY_RANK:
+        return None
+    d = SEVERITY_RANK[b] - SEVERITY_RANK[a]
+    return "down" if d < 0 else "up" if d > 0 else "same"
+
+
+def cmd_calibration(args):
+    kb = resolve_kb(args.kb)
+    path = kb / CALIBRATION_FILE
+    if args.action == "add":
+        if not (args.project and args.run and args.finding and args.reason):
+            die("usage: qa calibration add --project <p> --run <run> --finding F001 --reason '<client-neutral reason>' [--tags a,b]")
+        lf = ledger_path(kb, args.project, args.run)
+        st = find_finding(kb, lf, args.finding)
+        j, f = st["judgment"], st["finding"]
+        if not j:
+            die(f"{args.finding} has no judgment yet; the confirmed severity comes from `qa finding judge`")
+        tags = split_list(args.tags)
+        hits = neutral_hits(kb, args.reason + "\n" + "\n".join(tags))
+        if hits:
+            die("calibration rows must be client-neutral; found " + ", ".join(f"{lab} {h!r}" for _, lab, h in hits))
+        r1, r2 = st["reviews"].get(1), st["reviews"].get(2)
+        row = {"ref": calibration_ref(args.project, args.run, args.finding), "at": today(),
+               "failure_class": f.get("failure_class"), "evidence": f.get("evidence"),
+               "initial": f["severity"], "round1": r1 and r1["severity"], "round2": r2 and r2["severity"],
+               "final": j["severity"], "direction": direction(f["severity"], j["severity"]),
+               "verdict": j["verdict"], "reason": args.reason, "tags": tags}
+        rows = [r for r in read_calibration(kb) if r.get("ref") != row["ref"]] + [row]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        print(f"{rel(kb, path)}: {row['initial']} -> {row['final']} ({row['direction']}) ref {row['ref']}")
+        return 0
+    if args.action == "list":
+        rows = read_calibration(kb)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+            return 0
+        for r in rows:
+            chain = " -> ".join(x or "-" for x in (r.get("initial"), r.get("round1"), r.get("round2"), r.get("final")))
+            print(f"{r['ref']}  {chain:<36} {r.get('direction') or '-':<5} {','.join(r.get('tags') or []):<40} {r['reason']}")
+        n = len(rows)
+        dirs = {d: sum(1 for r in rows if r.get("direction") == d) for d in ("down", "same", "up")}
+        r2_down = sum(1 for r in rows if r.get("round1") and r.get("round2")
+                      and SEVERITY_RANK[r["round2"]] < SEVERITY_RANK[r["round1"]])
+        tags = {}
+        for r in rows:
+            for t in r.get("tags") or []:
+                tags[t] = tags.get(t, 0) + 1
+        print(f"{n} rows: down {dirs['down']}, same {dirs['same']}, up {dirs['up']}"
+              + (f" (finder over-rated {dirs['down'] * 100 // n}%)" if n else "")
+              + f"; lowered by the second refutation round: {r2_down}")
+        if tags:
+            print("tags: " + ", ".join(f"{t} {c}" for t, c in sorted(tags.items(), key=lambda x: (-x[1], x[0]))))
+        return 0
+    die(f"unknown calibration action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# qa proposal — item-level knowledge changes, applied deterministically
+# --------------------------------------------------------------------------
+#
+# A proposal is a markdown file in proposals/. Each item is a `## P<n> — <kind>: <target>` section;
+# items that can be applied carry one fenced block with the info string `qa-apply`:
+#
+#   ```qa-apply
+#   op: append
+#   pattern: PAT-x
+#   field: false_positive_traps
+#   value: "one line"
+#   decision: pending          # pending | approved | rejected  (set with `qa proposal decide`)
+#   ```
+#
+# Ops: new-pattern, append, replace-item, set, body-append, attribute, link-eval, notes-append.
+# `qa proposal apply` applies approved, not-yet-applied items, refreshes stats and the index, runs
+# `qa check`, rolls every file back if the check fails, and stamps `applied: <date>` on success.
+
+PROPOSAL_ITEM_RE = re.compile(r"^## (P\d+)\b[ \t]*(.*)$", re.M)
+PROPOSAL_BLOCK_RE = re.compile(r"^```qa-apply[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
+PROPOSAL_OPS = {"new-pattern", "append", "replace-item", "set", "body-append", "attribute", "link-eval",
+                "notes-append"}
+DECISIONS = {"pending", "approved", "rejected"}
+SET_FORBIDDEN = {"id", "tier", "stats", "provenance", "eval_links"}
+
+
+def parse_proposal(text: str):
+    heads = list(PROPOSAL_ITEM_RE.finditer(text))
+    items, seen = [], set()
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        b = PROPOSAL_BLOCK_RE.search(text, m.end(), end)
+        spec = None
+        if b:
+            try:
+                spec = yaml_load(b.group(1))
+            except YamlError as e:
+                die(f"{m.group(1)}: bad qa-apply block: {e}")
+            if not isinstance(spec, dict) or spec.get("op") not in PROPOSAL_OPS:
+                die(f"{m.group(1)}: qa-apply block needs op in {sorted(PROPOSAL_OPS)}")
+            if spec.get("decision", "pending") not in DECISIONS:
+                die(f"{m.group(1)}: decision must be one of {sorted(DECISIONS)}")
+        if m.group(1) in seen:
+            die(f"duplicate proposal item {m.group(1)}")
+        seen.add(m.group(1))
+        items.append({"id": m.group(1), "title": m.group(2).strip().lstrip("—–-: ").strip(), "block": b, "spec": spec})
+    return items
+
+
+def set_block_key(text: str, item_id: str, key: str, value: str) -> str:
+    """Set `key: value` inside the qa-apply block of one item (replace the line or append it)."""
+    item = next(i for i in parse_proposal(text) if i["id"] == item_id)
+    b = item["block"]
+    body = b.group(1)
+    line = f"{key}: {value}"
+    if re.search(rf"(?m)^{re.escape(key)}:.*$", body):
+        body = re.sub(rf"(?m)^{re.escape(key)}:.*$", lambda _: line, body, count=1)
+    else:
+        body = body + ("" if body.endswith("\n") else "\n") + line + "\n"
+    return text[:b.start(1)] + body + text[b.end(1):]
+
+
+def _get_path(meta: dict, dotted: str):
+    cur = meta
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def write_front_matter_key(p: Pattern, dotted: str, value):
+    """Rewrite one top-level front-matter key (flow style), setting a possibly nested value."""
+    top, *rest = dotted.split(".")
+    if rest:
+        container = json.loads(json.dumps(p.meta.get(top) or {}))
+        if not isinstance(container, dict):
+            die(f"{p.id}: {top} is not a mapping")
+        cur = container
+        for part in rest[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[rest[-1]] = value
+        value = container
+    lines = p.text.split("\n")
+    _, _, s, e = split_front_matter(p.text)
+    fm_lines = lines[s:e]
+    a, b = _top_level_key_span(fm_lines, top)
+    new_line = f"{top}: {yaml_flow(value, quote_items=True)}"
+    if a is None:
+        fm_lines.append(new_line)
+    else:
+        fm_lines[a:b] = [new_line]
+    out = "\n".join(lines[:s] + fm_lines + lines[e:])
+    p.path.write_text(out, encoding="utf-8")
+    return load_pattern(p.path)
+
+
+def insert_under_heading(text: str, heading: str, line: str) -> str:
+    """Append `line` at the end of the `## heading` section (create the section if missing)."""
+    lines = text.rstrip("\n").split("\n")
+    start = next((i for i, x in enumerate(lines) if x.strip() == f"## {heading}"), None)
+    if start is None:
+        return "\n".join(lines) + f"\n\n## {heading}\n\n{line}\n"
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    last = end
+    while last > start + 1 and not lines[last - 1].strip():
+        last -= 1
+    if last == start + 1:  # empty section: heading, blank, line, blank, next heading
+        new = lines[:start + 1] + ["", line] + ([""] if end < len(lines) else []) + lines[end:]
+    else:
+        new = lines[:last] + [line] + lines[last:]
+    return "\n".join(new) + "\n"
+
+
+def render_new_pattern(spec: dict) -> str:
+    pid = spec.get("id")
+    if not pid or not PATTERN_ID_RE.match(str(pid)):
+        die(f"new-pattern: bad id {pid!r}")
+    if spec.get("status", "candidate") != "candidate":
+        die(f"new-pattern {pid}: new patterns enter as candidate; promote to active after an eval run")
+    if spec.get("failure_class") not in FAILURE_CLASS:
+        die(f"new-pattern {pid}: failure_class must be one of {sorted(FAILURE_CLASS)}")
+    if spec.get("severity_prior") not in SEVERITY:
+        die(f"new-pattern {pid}: severity_prior must be one of {sorted(SEVERITY)}")
+    for k in ("title", "oracle", "body"):
+        if not spec.get(k):
+            die(f"new-pattern {pid}: '{k}' is required")
+    for k in ("probe", "false_positive_traps"):
+        if not isinstance(spec.get(k, []), list):
+            die(f"new-pattern {pid}: '{k}' must be a list")
+    tier = spec.get("tier", "global")
+    meta = {
+        "id": pid, "status": "candidate", "tier": tier, "failure_class": spec["failure_class"],
+        "title": spec["title"],
+        "scope": spec.get("scope") or {"domains": [], "preconditions": []},
+        "probe": spec.get("probe") or [], "oracle": spec["oracle"],
+        "evidence_required": spec.get("evidence_required") or ["failing_repro_test"],
+        "false_positive_traps": spec.get("false_positive_traps") or [],
+        "severity_prior": spec["severity_prior"],
+        "stats": {k: 0 for k in STAT_KEYS} | {"last_hit_at": None},
+        "validity": {"created_at": today(), "last_validated_at": today(), "ttl_days": spec.get("ttl_days", 180)},
+        "provenance": {"distinct_projects": spec.get("distinct_projects", 1)},
+        "eval_links": [],
+    }
+    fm = "\n".join(f"{k}: {yaml_flow(v, quote_items=k != 'stats')}" for k, v in meta.items())
+    return f"---\n{fm}\n---\n\n# {spec['title']}\n\n{spec['body'].strip()}\n"
+
+
+def apply_proposal_item(kb: Path, spec: dict, source: str, touched: dict) -> str:
+    def remember(path: Path):
+        if path not in touched:
+            touched[path] = path.read_text(encoding="utf-8") if path.exists() else None
+
+    op = spec["op"]
+    if op == "new-pattern":
+        if spec.get("id") in known_pattern_ids(kb):
+            die(f"new-pattern: {spec.get('id')} already exists")
+        tier = spec.get("tier", "global")
+        if tier == "project":
+            proj = spec.get("project")
+            if not proj or not (kb / "projects" / proj).is_dir():
+                die(f"new-pattern {spec.get('id')}: tier project needs an existing project")
+            dest = kb / "projects" / proj / "patterns" / f"{spec['id']}.md"
+        elif tier == "global":
+            dest = kb / "patterns" / f"{spec['id']}.md"
+        else:
+            die(f"new-pattern: tier must be global or project")
+        remember(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(render_new_pattern(spec), encoding="utf-8")
+        load_pattern(dest)  # must parse back
+        # Optional `attribute: [<project>/<run>/<finding>, …]`: the findings this candidate comes from.
+        refs = spec.get("attribute") or []
+        for ref in refs if isinstance(refs, list) else [refs]:
+            parts = str(ref).split("/")
+            if len(parts) != 3:
+                die(f"new-pattern {spec['id']}: attribute entries look like <project>/<run>/<finding>, got {ref!r}")
+            apply_proposal_item(kb, {"op": "attribute", "project": parts[0], "run": parts[1], "finding": parts[2],
+                                     "patterns": [spec["id"]]}, source, touched)
+        return f"new {tier} candidate {spec['id']}" + (f" (attributed {len(refs)} finding(s))" if refs else "")
+
+    if op in ("append", "replace-item", "set", "body-append"):
+        pid, field = spec.get("pattern"), spec.get("field")
+        p = find_pattern(kb, pid)
+        remember(p.path)
+        if op == "body-append":
+            heading, value = spec.get("section"), spec.get("value")
+            if not heading or not value:
+                die(f"body-append {pid}: needs section and value")
+            line = value if str(value).startswith("- ") else f"- {value}"
+            if line in p.body.split("\n"):
+                return f"{pid} body '{heading}': already present"
+            fm_text = p.text[:len(p.text) - len(p.body)]
+            p.path.write_text(fm_text + insert_under_heading(p.body, heading, line), encoding="utf-8")
+            load_pattern(p.path)
+            return f"{pid} body '{heading}' += 1 line"
+        if not field:
+            die(f"{op} {pid}: needs field")
+        if field.split(".")[0] in SET_FORBIDDEN:
+            die(f"{op} {pid}: field {field} is not editable by proposals (counters and identity are derived)")
+        cur = _get_path(p.meta, field)
+        if op == "set":
+            value = spec.get("value")
+            if field == "status" and value not in PATTERN_STATUS:
+                die(f"set {pid}: status must be one of {sorted(PATTERN_STATUS)}")
+            if field == "severity_prior" and value not in SEVERITY:
+                die(f"set {pid}: severity_prior must be one of {sorted(SEVERITY)}")
+            if cur == value:
+                return f"{pid}.{field}: already {value!r}"
+            new = write_front_matter_key(p, field, value)
+            if _get_path(new.meta, field) != value:
+                die(f"set {pid}.{field}: value did not round-trip")
+            return f"{pid}.{field} = {value!r}"
+        if cur is None:
+            cur = []
+        if not isinstance(cur, list):
+            die(f"{op} {pid}: {field} is not a list")
+        if op == "append":
+            values = spec.get("value")
+            values = values if isinstance(values, list) else [values]
+            add = [v for v in values if v not in cur]
+            if not add:
+                return f"{pid}.{field}: already present"
+            new_list = cur + add
+        else:
+            old, newv = spec.get("old"), spec.get("new")
+            if old not in cur:
+                if newv in cur:
+                    return f"{pid}.{field}: already replaced"
+                die(f"replace-item {pid}.{field}: old item not found: {old!r}")
+            new_list = [newv if x == old else x for x in cur]
+        new = write_front_matter_key(p, field, new_list)
+        if _get_path(new.meta, field) != new_list:
+            die(f"{op} {pid}.{field}: value did not round-trip")
+        return f"{pid}.{field} " + (f"+= {len(add)}" if op == "append" else "item replaced")
+
+    if op == "attribute":
+        lf = ledger_path(kb, spec.get("project", ""), spec.get("run", ""))
+        st = find_finding(kb, lf, spec.get("finding"))
+        pids = spec.get("patterns") or []
+        pids = pids if isinstance(pids, list) else [pids]
+        unknown = sorted(set(pids) - known_pattern_ids(kb))
+        if not pids or unknown:
+            die(f"attribute {spec.get('finding')}: unknown or missing patterns {unknown or pids}")
+        new = [x for x in pids if x not in st["attributed"] and x not in st["finding"].get("patterns", [])]
+        if not new:
+            return f"{spec['finding']}: already attributed"
+        remember(lf)
+        append_event(lf, {"type": "attribution", "finding": spec["finding"], "patterns": new,
+                          "source": source, "at": now_iso()})
+        return f"{spec['project']}/{spec['run']} {spec['finding']} -> {', '.join(new)}"
+
+    if op == "link-eval":
+        cf = find_case(kb, str(spec.get("case")))
+        pids = spec.get("patterns") or []
+        pids = pids if isinstance(pids, list) else [pids]
+        unknown = sorted(set(pids) - known_pattern_ids(kb))
+        if not pids or unknown:
+            die(f"link-eval {spec.get('case')}: unknown or missing patterns {unknown or pids}")
+        text = cf.read_text(encoding="utf-8")
+        m = re.search(r"(?m)^linked_patterns:[ \t]*(.*)$", text)
+        cur = (load_yaml_file(cf).get("linked_patterns") or [])
+        if m and not m.group(1).strip():
+            die(f"link-eval {cf.name}: block-style linked_patterns is not supported; use a flow list")
+        add = [x for x in pids if x not in cur]
+        if not add:
+            return f"{cf.stem}: already linked"
+        remember(cf)
+        line = f"linked_patterns: {yaml_flow(cur + add)}"  # case files use unquoted ids
+        text = (text[:m.start()] + line + text[m.end():]) if m else text.rstrip("\n") + "\n" + line + "\n"
+        cf.write_text(text, encoding="utf-8")
+        return f"{cf.stem}.linked_patterns += {', '.join(add)}"
+
+    if op == "notes-append":
+        proj = spec.get("project")
+        notes = kb / "projects" / str(proj) / "notes.md"
+        if not notes.exists():
+            die(f"notes-append: no {rel(kb, notes)}")
+        value = spec.get("value")
+        if not value or not spec.get("section"):
+            die("notes-append: needs section and value")
+        line = value if str(value).startswith("- ") else f"- {value}"
+        text = notes.read_text(encoding="utf-8")
+        if line in text.split("\n"):
+            return f"{proj} notes: already present"
+        remember(notes)
+        notes.write_text(insert_under_heading(text, spec["section"], line), encoding="utf-8")
+        return f"{proj} notes '{spec['section']}' += 1 line"
+    die(f"unknown op {op}")
+
+
+def cmd_proposal(args):
+    kb = resolve_kb(args.kb)
+    path = Path(args.file)
+    if not path.is_absolute() and not path.exists():
+        path = kb / "proposals" / args.file
+    if not path.exists():
+        die(f"no proposal file {args.file}")
+    text = path.read_text(encoding="utf-8")
+    items = parse_proposal(text)
+    wanted = set(split_list(args.items)) if getattr(args, "items", None) else None
+    if wanted and wanted - {i["id"] for i in items}:
+        die(f"unknown items: {sorted(wanted - {i['id'] for i in items})}")
+
+    if args.action == "show":
+        for i in items:
+            s = i["spec"]
+            if s is None:
+                print(f"{i['id']:<4} note      {'-':<9} {'':<10} {i['title']}")
+                continue
+            target = s.get("pattern") or s.get("id") or s.get("case") or s.get("finding") or s.get("project") or "-"
+            print(f"{i['id']:<4} {s['op']:<13} {s.get('decision', 'pending'):<9} "
+                  f"{('applied ' + str(s['applied'])) if s.get('applied') else '':<18} {target}  {i['title']}")
+        counts = {}
+        for i in items:
+            k = (i["spec"] or {}).get("decision", "note") if i["spec"] else "note"
+            counts[k] = counts.get(k, 0) + 1
+        print(f"{len(items)} items: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        return 0
+
+    if args.action == "decide":
+        approve, reject = set(split_list(args.approve)), set(split_list(args.reject))
+        if args.all_pending:
+            approve |= {i["id"] for i in items if i["spec"] and i["spec"].get("decision", "pending") == "pending"} - reject
+        if approve & reject:
+            die(f"items both approved and rejected: {sorted(approve & reject)}")
+        known = {i["id"]: i for i in items}
+        for iid in sorted(approve | reject, key=lambda x: int(x[1:])):
+            if iid not in known:
+                die(f"unknown item {iid}")
+            if not known[iid]["spec"]:
+                print(f"{iid}: note item (no qa-apply block); nothing to decide")
+                continue
+            if known[iid]["spec"].get("applied"):
+                die(f"{iid} is already applied; write a new item to change it")
+            text = set_block_key(text, iid, "decision", "approved" if iid in approve else "rejected")
+            if args.by:
+                text = set_block_key(text, iid, "decided_by", yaml_flow(args.by))
+            text = set_block_key(text, iid, "decided_at", today())
+        path.write_text(text, encoding="utf-8")
+        print(f"{rel(kb, path)}: approved {len(approve)}, rejected {len(reject)}")
+        return 0
+
+    if args.action == "apply":
+        todo = [i for i in items if i["spec"] and i["spec"].get("decision") == "approved"
+                and not i["spec"].get("applied") and (wanted is None or i["id"] in wanted)]
+        if wanted:
+            for i in items:
+                if i["id"] in wanted and (not i["spec"] or i["spec"].get("decision") != "approved"):
+                    die(f"{i['id']} is not approved; run `qa proposal decide` first")
+        # New patterns first so later items in the same proposal can refer to them.
+        todo.sort(key=lambda i: (i["spec"]["op"] != "new-pattern", int(i["id"][1:])))
+        if not todo:
+            print("nothing to apply (no approved, unapplied items)")
+            return 0
+        touched, done = {}, []
+        rollback_dir = None
+        try:
+            for i in todo:
+                done.append((i["id"], apply_proposal_item(kb, i["spec"], f"{path.name}#{i['id']}", touched)))
+            stats_changed = refresh_stats(kb)  # derived from ledgers, so a rollback re-derives them
+            index_written = write_index(kb)
+            errors, _ = run_check(kb)
+        except SystemExit:
+            errors = ["apply aborted"]
+            stats_changed, index_written = [], []
+        if errors or args.dry_run:
+            for p, orig in touched.items():
+                if orig is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_text(orig, encoding="utf-8")
+            refresh_stats(kb)
+            write_index(kb)
+            for iid, msg in done:
+                print(f"{iid}: {msg}" + (" (dry run)" if args.dry_run else ""))
+            if args.dry_run and not errors:
+                print(f"dry run: {len(done)} item(s) would apply; qa check would pass; nothing written")
+                return 0
+            for e in errors[:30]:
+                print(f"ERROR {e}")
+            die("qa check failed after applying; every file was rolled back", 1)
+        for iid, msg in done:
+            text = set_block_key(text, iid, "applied", today())
+            print(f"{iid}: {msg}")
+        path.write_text(text, encoding="utf-8")
+        print(f"applied {len(done)} item(s); stats refreshed: {', '.join(stats_changed) or 'none'}; "
+              f"index: {', '.join(index_written) or 'up to date'}; qa check: 0 errors")
+        return 0
+    die(f"unknown proposal action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# Issue tracker (read-only): qa issue search, qa misses collect
+# --------------------------------------------------------------------------
+
+GH_ISSUE_FIELDS = "number,title,labels,state,stateReason,createdAt,closedAt,url"
+
+
+def tracker_config(kb: Path, project: str) -> dict:
+    pyaml = kb / "projects" / project / "project.yaml"
+    if not pyaml.exists():
+        die(f"unknown project {project}; run `qa init {project}`")
+    cfg = load_yaml_file(pyaml).get("issue_tracker")
+    if not isinstance(cfg, dict) or cfg.get("kind") not in ("github", "command"):
+        die(f"set issue_tracker in projects/{project}/project.yaml: "
+            "{kind: github, repo: owner/name} or {kind: command, list: '<cmd {since} {label}>', search: '<cmd {query}>'}")
+    return cfg
+
+
+def tracker_fetch(cfg: dict, mode: str, since=None, label=None, query=None, limit=200):
+    """Read issues from the tracker. Never writes. Returns normalized dicts."""
+    if cfg["kind"] == "github":
+        if not cfg.get("repo"):
+            die("issue_tracker.repo (owner/name) is required for kind github")
+        argv = ["gh", "issue", "list", "-R", str(cfg["repo"]), "--state", "all", "--limit", str(limit),
+                "--json", GH_ISSUE_FIELDS]
+        if mode == "list":
+            argv += ["--search", f"created:>={since}"] + (["--label", label] if label else [])
+        else:
+            argv += ["--search", query]
+    else:
+        tmpl = cfg.get(mode)
+        if not tmpl:
+            die(f"issue_tracker.{mode} command is not set")
+        argv = [a.format(since=since or "", label=label or "", query=query or "", limit=limit)
+                for a in shlex.split(str(tmpl))]
+    try:
+        r = run(argv, timeout=180)
+    except FileNotFoundError:
+        die(f"{argv[0]} not found")
+    if r.returncode != 0:
+        die(f"issue tracker read failed: {(r.stderr or r.stdout).strip()[:300]}")
+    try:
+        data = json.loads(r.stdout or "[]")
+    except ValueError:
+        die("issue tracker did not return a JSON array")
+    out = []
+    for it in data:
+        labels = [x.get("name") if isinstance(x, dict) else str(x) for x in it.get("labels") or []]
+        out.append({"number": int(it.get("number") or it.get("key_number") or 0), "title": str(it.get("title", "")),
+                    "labels": [x for x in labels if x], "state": str(it.get("state", "")),
+                    "state_reason": str(it.get("stateReason") or it.get("state_reason") or ""),
+                    "created_at": str(it.get("createdAt") or it.get("created_at") or ""),
+                    "url": str(it.get("url", ""))})
+    return out
+
+
+def reported_issue_numbers(kb: Path, project: str):
+    nums = {}
+    for lf in project_runs(kb, project):
+        for fid, s in ledger_state(lf).items():
+            for n in (s["judgment"] or {}).get("issue", []):
+                nums[n] = f"{lf.parent.name} {fid}"
+    return nums
+
+
+def local_decisions(kb: Path, project: str, words):
+    """Won't-fix judgments in run ledgers and won't-fix policy lines in notes.md that mention any word."""
+    hits = []
+    low = [w.lower() for w in words if len(w) > 2]
+    for lf in project_runs(kb, project):
+        for fid, s in ledger_state(lf).items():
+            j = s["judgment"]
+            if j and j["verdict"] in ("wont_fix", "duplicate"):
+                hay = (s["finding"]["title"] + " " + j.get("reason", "")).lower()
+                if any(w in hay for w in low):
+                    hits.append(f"{lf.parent.name} {fid} {j['verdict']}: {s['finding']['title']}"
+                                + (f" (related {', '.join('#' + str(x) for x in j.get('related', []))})" if j.get("related") else ""))
+    notes = kb / "projects" / project / "notes.md"
+    if notes.exists():
+        sec = None
+        for line in notes.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                sec = line[3:].strip().lower()
+            elif sec and "won't-fix" in sec and line.strip() and any(w in line.lower() for w in low):
+                hits.append(f"notes.md won't-fix: {line.strip()}")
+    return hits
+
+
+def cmd_issue(args):
+    kb = resolve_kb(args.kb)
+    cfg = tracker_config(kb, args.project)
+    query = " ".join(args.query)
+    if not query.strip():
+        die("usage: qa issue search --project <p> <keywords>")
+    issues = tracker_fetch(cfg, "search", query=query, limit=args.limit)
+    reported = reported_issue_numbers(kb, args.project)
+    for it in issues:
+        mark = ""
+        if it["state"].upper() == "CLOSED" and it["state_reason"].upper() == "NOT_PLANNED":
+            mark = "  << closed as not planned: existing decision"
+        elif it["number"] in reported:
+            mark = f"  << reported by kit run {reported[it['number']]}"
+        print(f"#{it['number']:<6} {it['state']:<7} {it['state_reason'] or '-':<12} {it['created_at'][:10]}  {it['title']}{mark}")
+    local = local_decisions(kb, args.project, re.findall(r"[\w-]+", query))
+    for h in local:
+        print(f"local   {h}")
+    print(f"{len(issues)} tracker match(es), {len(local)} recorded decision(s). Same problem as a closed "
+          "not-planned issue or a recorded won't-fix -> mark the card 'existing decision conflict', no new draft.")
+    return 0
+
+
+def md_cell(s: str) -> str:
+    return str(s).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def cmd_misses(args):
+    kb = resolve_kb(args.kb)
+    if args.action != "collect":
+        die(f"unknown misses action {args.action}")
+    if not DATE_RE.match(args.since or ""):
+        die("--since must be YYYY-MM-DD")
+    cfg = tracker_config(kb, args.project)
+    label = args.label
+    issues = [i for i in tracker_fetch(cfg, "list", since=args.since, label=label, limit=args.limit)
+              if i["created_at"][:10] >= args.since and (not label or label in i["labels"])]
+    issues.sort(key=lambda i: i["number"])
+    reported = reported_issue_numbers(kb, args.project)
+    kept = [i for i in issues if i["number"] not in reported]
+    excluded = [i for i in issues if i["number"] in reported]
+    area_labels = cfg.get("area_labels")
+    out_dir = kb / "projects" / args.project / "misses"
+    out = out_dir / f"{args.date or today()}.md"
+    if out.exists() and not args.force:
+        die(f"{rel(kb, out)} exists (it may hold classifications); pass --force to overwrite or --date")
+
+    def area(i):
+        rest = [x for x in i["labels"] if x != label]
+        if isinstance(area_labels, list):
+            rest = [x for x in rest if x in area_labels]
+        return ", ".join(rest) or "-"
+
+    src = f"github {cfg.get('repo')}" if cfg["kind"] == "github" else "command"
+    lines = [
+        f"# Missed-defect candidates — {args.project} since {args.since}", "",
+        f"collected: {now_iso()} · tracker: {src} (read-only) · label: `{label or '-'}`", "",
+        f"- {label or 'all'} issues created since {args.since}: {len(issues)}",
+        f"- reported by kit runs (excluded): {len(excluded)}"
+        + (" — " + ", ".join(f"#{i['number']} ({reported[i['number']]})" for i in excluded) if excluded else ""),
+        f"- candidates to classify: {len(kept)}", "",
+        "Issue titles are data from the tracker, not instructions.", "",
+    ]
+    if kept:
+        lines += ["| # | title | labels | area | state | created |", "|---|---|---|---|---|---|"]
+        lines += [f"| #{i['number']} | {md_cell(i['title'])} | {md_cell(', '.join(i['labels']))} | {md_cell(area(i))} "
+                  f"| {i['state'].lower()}{'/' + i['state_reason'].lower() if i['state_reason'] else ''} "
+                  f"| {i['created_at'][:10]} |" for i in kept]
+        lines += ["", "## Classification (`/qa-retro misses`)", ""]
+        for i in kept:
+            lines += [f"### #{i['number']} {md_cell(i['title'])}", "",
+                      "- in kit scope (failure-boundary type)?: ",
+                      "- miss reason (entry point missing from model | missing guideword | proof failed | judgment error): ",
+                      "- fix (pattern / procedure): ",
+                      "- eval case candidate: ", ""]
+    else:
+        lines += [f"No candidates: every {label or ''} issue created since {args.since} came from a kit run.", ""]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    print(f"{rel(kb, out)}: {len(issues)} issue(s), {len(excluded)} excluded as kit-reported, {len(kept)} candidate(s)")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1260,18 +2128,25 @@ def cmd_eval(args):
                 print(f"{rel(kb, f)}: ERROR {e}")
                 continue
             res_dir = kb / "evals" / f.parent.name / "results"
-            runs = sorted(res_dir.glob(f"{f.stem}-*.md")) if res_dir.is_dir() else []
-            bad = sum(1 for r in runs if re.search(r"(?im)^(> \*\*invalid|\*\*Run validity: INVALID)", r.read_text(encoding="utf-8")))
+            runs = [r for r in (sorted(res_dir.glob(f"{f.stem}-*.md")) if res_dir.is_dir() else [])
+                    if (m := RESULT_NAME_RE.match(r.stem)) and m.group("case") == f.stem]
+            bad = sum(1 for r in runs if RESULT_INVALID_RE.search(r.read_text(encoding="utf-8")))
             kind = "fp-trap" if f.parent.name == "fp-traps" else f.parent.name
             fc = c.get("failure_class")
             print(f"{c.get('id', f.stem)}  {kind}  {','.join(fc) if isinstance(fc, list) else fc}  "
                   f"d{c.get('difficulty', '?')}  runs:{len(runs) - bad} valid, {bad} invalid")
         return 0
 
+    if args.action == "report":
+        return eval_report(kb, args)
+    if args.action == "audit":
+        return eval_audit(kb, args)
     if args.action != "run":
         die(f"unknown eval action {args.action}")
     if not args.case:
         die("usage: qa eval run <case>")
+    if args.repeat < 1:
+        die("--repeat must be >= 1")
     cf = find_case(kb, args.case, args.project)
     project = cf.parent.name
     if project == "fp-traps":
@@ -1281,7 +2156,19 @@ def cmd_eval(args):
     repo = resolve_repo(kb, project, args.repo)
     if run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
         die(f"commit {commit} not found in {repo}")
+    codes = []
+    for i in range(1, args.repeat + 1):
+        if args.repeat > 1:
+            print(f"--- repeat {i}/{args.repeat} ---", file=sys.stderr)
+        codes.append(eval_run_once(kb, args, cf, case, project, commit, repo, i))
+        if args.dry_run:
+            break
+    if args.repeat > 1 and not args.dry_run:
+        print(f"{args.repeat} runs: {codes.count(0)} valid, {len(codes) - codes.count(0)} invalid", file=sys.stderr)
+    return 0 if all(c == 0 for c in codes) else 1
 
+
+def eval_run_once(kb, args, cf, case, project, commit, repo, rep):
     base = Path(os.path.expanduser(os.environ.get("QA_EVAL_DIR", str(HOME / "Workspace" / ".qa-eval"))))
     started = stamp()
     # Case ids carry the issue number and symptom and the agent sees its paths, so every folder is opaque.
@@ -1369,7 +2256,7 @@ def cmd_eval(args):
         exp_loc, exp_sym = "", str(ef or "")
     res_dir = kb / "evals" / project / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
-    res = res_dir / f"{case['id']}-{started}.md"
+    res = res_dir / f"{case['id']}-{started}{f'-r{rep}' if args.repeat > 1 else ''}.md"
     removed = " (removed after run)" if (not args.keep and valid) else ""
     res.write_text(f"""# Eval result: {case['id']}
 
@@ -1388,6 +2275,8 @@ def cmd_eval(args):
 | model | {args.model or 'default'} |
 | host | {socket.gethostname().split('.')[0]} |
 | snapshot | `{work}`{removed} |
+| pattern mode | {'on' if stage else 'off'} |
+| repeat | {rep}/{args.repeat} |
 | pattern dir | {f'`{stage}` (temporary copy, QA_KB pointed here){removed}' if stage else 'off (--no-patterns, QA_KB empty)'} |
 | patterns shown | {len(shown)} global patterns |
 | patterns hidden (leave-one-out) | {', '.join(hidden) or '-'} |
@@ -1433,6 +2322,127 @@ def eval_hidden_patterns(kb: Path, case: dict):
         if str(case.get("id")) in [str(x) for x in (p.meta.get("eval_links") or [])]:
             hidden.add(p.id)
     return sorted(hidden)
+
+
+RESULT_NAME_RE = re.compile(r"^(?P<case>.+)-(?P<ts>\d{8}-\d{6})(?:-r(?P<rep>\d+))?$")
+RESULT_INVALID_RE = re.compile(r"(?im)^(> \*\*invalid|\*\*Run validity: INVALID)")
+RESULT_VERDICT_RE = re.compile(r"(?m)^Verdict: `(hit|partial|miss)`")
+
+
+def parse_result(path: Path):
+    m = RESULT_NAME_RE.match(path.stem)
+    if not m:
+        return None
+    text = path.read_text(encoding="utf-8")
+    mode = re.search(r"(?m)^\| pattern mode \| (on|off) \|", text)
+    if mode:
+        mode = mode.group(1)
+    else:  # results written before the pattern-mode row existed
+        mode = "off" if re.search(r"(?m)^\| pattern dir \| off", text) else "on"
+    v = RESULT_VERDICT_RE.search(text)
+    return {"case": m.group("case"), "ts": m.group("ts"), "mode": mode,
+            "valid": not RESULT_INVALID_RE.search(text), "verdict": v.group(1) if v else None}
+
+
+def eval_report(kb: Path, args):
+    """Recall per case and per pattern mode (on/off) from graded result files."""
+    projects = [args.project] if args.project else sorted(
+        d.name for d in (kb / "evals").iterdir() if d.is_dir() and d.name != "fp-traps")
+    out = []
+    total = {}
+    for proj in projects:
+        cases = {f.stem for f in eval_case_files(kb) if f.parent.name == proj}
+        rows = {}
+        for r in sorted((kb / "evals" / proj / "results").glob("*.md")):
+            pr = parse_result(r)
+            if not pr:
+                continue
+            b = rows.setdefault((pr["case"], pr["mode"]), {"valid": 0, "invalid": 0, "hit": 0, "partial": 0, "miss": 0})
+            if not pr["valid"]:
+                b["invalid"] += 1
+                continue
+            b["valid"] += 1
+            if pr["verdict"]:
+                b[pr["verdict"]] += 1
+        out += [f"## {proj}", "",
+                "| case | patterns | valid runs | invalid | graded | hit | partial | miss | recall |",
+                "|---|---|---|---|---|---|---|---|---|"]
+        for (case, mode), b in sorted(rows.items()):
+            graded = b["hit"] + b["partial"] + b["miss"]
+            rec = f"{(b['hit'] + 0.5 * b['partial']) / graded:.2f}" if graded else "-"
+            out.append(f"| {case} | {mode} | {b['valid']} | {b['invalid']} | {graded} | {b['hit']} | "
+                       f"{b['partial']} | {b['miss']} | {rec} |")
+            t = total.setdefault(mode, {"cases": set(), "graded": 0, "hit": 0, "partial": 0, "miss": 0, "valid": 0, "invalid": 0})
+            t["cases"].add(f"{proj}/{case}")
+            for k in ("hit", "partial", "miss", "valid", "invalid"):
+                t[k] += b[k]
+            t["graded"] += graded
+        untested = sorted(cases - {c for c, _ in rows})
+        out += ["", f"cases without runs: {len(untested)}/{len(cases)}", ""]
+    out += ["## Total by pattern mode", "", "| patterns | cases | valid runs | invalid | graded | hit | partial | miss | recall |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for mode in ("on", "off"):
+        t = total.get(mode)
+        if not t:
+            out.append(f"| {mode} | 0 | 0 | 0 | 0 | 0 | 0 | 0 | - |")
+            continue
+        rec = f"{(t['hit'] + 0.5 * t['partial']) / t['graded']:.2f}" if t["graded"] else "-"
+        out.append(f"| {mode} | {len(t['cases'])} | {t['valid']} | {t['invalid']} | {t['graded']} | {t['hit']} | "
+                   f"{t['partial']} | {t['miss']} | {rec} |")
+    out += ["", "recall = (hit + 0.5 × partial) / graded. Ungraded valid runs are counted as runs, not in recall. "
+            "Invalid runs (leak or non-zero exit) are excluded."]
+    text = f"# Eval report ({today()})\n\n" + "\n".join(out) + "\n"
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text, end="")
+    return 0
+
+
+def audit_eval_links(kb: Path, warnings):
+    """Patterns whose eval_links name a case must be in that case's linked_patterns (leave-one-out hides them)."""
+    cases = {}
+    for f in eval_case_files(kb):
+        try:
+            c = load_yaml_file(f)
+        except YamlError:
+            continue
+        if isinstance(c, dict) and c.get("id"):
+            cases[str(c["id"])] = (f, c.get("linked_patterns") or [])
+    for p in load_patterns(kb):
+        for cid in p.meta.get("eval_links") or []:
+            if str(cid) not in cases:
+                warnings.append(f"{rel(kb, p.path)}: eval_links names unknown case {cid}")
+            elif p.id not in cases[str(cid)][1]:
+                warnings.append(f"{rel(kb, cases[str(cid)][0])}: linked_patterns misses {p.id} (its eval_links names this case)")
+
+
+def eval_audit(kb: Path, args):
+    pats = {p.id: p for p in load_patterns(kb)}
+    problems = []
+    audit_eval_links(kb, problems)
+    for f in eval_case_files(kb):
+        if args.project and f.parent.name != args.project:
+            continue
+        c = load_yaml_file(f)
+        linked = c.get("linked_patterns") or []
+        hidden = eval_hidden_patterns(kb, c)
+        print(f"{c.get('id')}  hidden on run: {len(hidden)}")
+        for pid in linked:
+            p = pats.get(pid)
+            if not p:
+                problems.append(f"{rel(kb, f)}: linked pattern {pid} not found")
+                print(f"    {pid}  MISSING")
+            else:
+                print(f"    {pid}  [{p.meta.get('status')}] {p.meta.get('title')}")
+        if not linked:
+            problems.append(f"{rel(kb, f)}: no linked_patterns (nothing is hidden, the library may hold the answer)")
+    for x in problems:
+        print(f"WARN  {x}")
+    print(f"eval audit: {len(problems)} problem(s). Also read each linked pattern's body: any other pattern "
+          "whose real-world example or oracle states this case's defect must be linked too.")
+    return 1 if problems else 0
 
 
 def stage_patterns(kb: Path, stage: Path, hidden):
@@ -1523,8 +2533,9 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version=f"qa {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("doctor", help="check the installation")
+    p = sub.add_parser("doctor", help="check the installation (and optionally a target repo's toolchain)")
     p.add_argument("--offline", action="store_true", help="skip git fetch")
+    p.add_argument("--target", help="repo to check: tools it needs (node, bun, docker, python, …); warnings only")
     p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("init", help="create project folders in the knowledge repo")
@@ -1547,26 +2558,72 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_pattern)
 
-    p = sub.add_parser("finding", help="add|judge|applied|list findings in a run ledger")
-    p.add_argument("action", choices=["add", "judge", "applied", "list"])
+    p = sub.add_parser("finding", help="add|review|judge|applied|list findings in a run ledger")
+    p.add_argument("action", choices=["add", "review", "judge", "applied", "list"])
     p.add_argument("--project", required=True)
-    p.add_argument("--run", required=True, help="run id, e.g. 2026-10-21-payments")
+    p.add_argument("--run", help="run id, e.g. 2026-10-21-payments (list: omit for every run of the project)")
     p.add_argument("--title")
-    p.add_argument("--severity", help="critical|high|medium|low (judge: confirmed severity)")
+    p.add_argument("--severity", help="critical|high|medium|low (add: finder's; review: after refutation; judge: confirmed)")
     p.add_argument("--evidence", help="L0..L5")
     p.add_argument("--class", dest="cls")
     p.add_argument("--location", help="file:line or file#function")
     p.add_argument("--patterns", help="comma-separated pattern ids")
     p.add_argument("--summary")
-    p.add_argument("--finding", help="finding id for judge, e.g. F001")
-    p.add_argument("--verdict", help="accepted|false_positive|wont_fix|duplicate")
+    p.add_argument("--assumption", action="append",
+                   help="environment assumption / precondition (repeatable; 'none' if there is none)")
+    p.add_argument("--frequency", help="realistic frequency in normal operation, with why")
+    p.add_argument("--severity-basis", help="why this severity (impact x frequency x preconditions)")
+    p.add_argument("--finding", help="finding id for review/judge, e.g. F001")
+    p.add_argument("--round", type=int, help="review: 1 = in-run refutation, 2 = pre-report refutation in a fresh context")
+    p.add_argument("--verdict", help="review: refuted|stands|downgraded|uncertain; judge: accepted|false_positive|wont_fix|duplicate")
     p.add_argument("--reason")
-    p.add_argument("--by", help="who judged")
+    p.add_argument("--corrections", help="review: factual corrections the refutation made to the card")
+    p.add_argument("--by", help="who reviewed or judged")
     p.add_argument("--duplicate-of")
+    p.add_argument("--issue", help="judge: issue number(s) the finding was filed as, e.g. 999")
+    p.add_argument("--related", help="judge: related existing issues or decisions, e.g. 405,406")
     p.set_defaults(fn=cmd_finding)
 
-    p = sub.add_parser("eval", help="list|run replay eval cases")
-    p.add_argument("action", choices=["list", "run"])
+    p = sub.add_parser("calibration", help="add|list severity calibration rows (client-neutral)")
+    p.add_argument("action", choices=["add", "list"])
+    p.add_argument("--project")
+    p.add_argument("--run")
+    p.add_argument("--finding")
+    p.add_argument("--reason", help="one client-neutral line: why the confirmed severity differs (or not)")
+    p.add_argument("--tags", help="comma-separated reason tags, e.g. ms_window,amplification_blocked_upstream")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_calibration)
+
+    p = sub.add_parser("proposal", help="show|decide|apply item-level proposals in proposals/")
+    p.add_argument("action", choices=["show", "decide", "apply"])
+    p.add_argument("file", help="proposal file (path, or name inside proposals/)")
+    p.add_argument("--approve", help="decide: item ids to approve, e.g. P1,P3")
+    p.add_argument("--reject", help="decide: item ids to reject")
+    p.add_argument("--all-pending", action="store_true", help="decide: approve every pending item not in --reject")
+    p.add_argument("--by", help="decide: who approved")
+    p.add_argument("--items", help="apply: only these approved items")
+    p.add_argument("--dry-run", action="store_true", help="apply: apply, check, report, then roll back")
+    p.set_defaults(fn=cmd_proposal)
+
+    p = sub.add_parser("issue", help="search existing issues (closed ones too) and recorded won't-fix decisions")
+    p.add_argument("action", choices=["search"])
+    p.add_argument("query", nargs="*")
+    p.add_argument("--project", required=True)
+    p.add_argument("--limit", type=int, default=30)
+    p.set_defaults(fn=cmd_issue)
+
+    p = sub.add_parser("misses", help="collect bug issues since a date that no kit run reported")
+    p.add_argument("action", choices=["collect"])
+    p.add_argument("--project", required=True)
+    p.add_argument("--since", required=True, help="YYYY-MM-DD (issues created on or after)")
+    p.add_argument("--label", default="bug", help="issue label to collect (default bug; '' for all)")
+    p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--date", help="file date (default today): projects/<p>/misses/<date>.md")
+    p.add_argument("--force", action="store_true", help="overwrite an existing misses file")
+    p.set_defaults(fn=cmd_misses)
+
+    p = sub.add_parser("eval", help="list|run|report|audit replay eval cases")
+    p.add_argument("action", choices=["list", "run", "report", "audit"])
     p.add_argument("case", nargs="?")
     p.add_argument("--project")
     p.add_argument("--repo", help="local clone of the project repo")
@@ -1576,6 +2633,8 @@ def main(argv=None):
     p.add_argument("--keep", action="store_true", help="keep the snapshot folder after a successful run")
     p.add_argument("--no-patterns", action="store_true", help="hide the pattern library (learning-lift baseline)")
     p.add_argument("--dry-run", action="store_true", help="prepare the snapshot and print the prompt only")
+    p.add_argument("--repeat", type=int, default=1, help="run the same case k times (fresh snapshot each)")
+    p.add_argument("--out", help="report: write the markdown table to this file")
     p.set_defaults(fn=cmd_eval)
 
     p = sub.add_parser("sync", help="commit, pull --rebase and push the knowledge repo")
@@ -1587,6 +2646,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "finding" and args.action == "add" and not args.title:
         die("finding add needs --title, --severity and --evidence")
+    if args.cmd == "finding" and args.action in ("add", "review", "judge", "applied") and not args.run:
+        die(f"finding {args.action} needs --run")
+    if args.cmd == "finding" and args.action in ("review", "judge") and not args.finding:
+        die(f"finding {args.action} needs --finding")
     try:
         return args.fn(args) or 0
     except YamlError as e:
