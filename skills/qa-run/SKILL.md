@@ -1,7 +1,7 @@
 ---
 name: qa-run
-description: Failure-focused QA run on a code scope — finds defects at failure boundaries, sad paths and error propagation paths (payments, webhooks, retries, concurrency, state machines, partial failure, external integrations), proves them with evidence, has them refuted by qa-skeptic, and reports defect cards. Use when asked to "QA", "break", "find failure modes in", or "run qa-run on" a feature, flow or path set.
-argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id>]"
+description: Failure-focused QA run on a code scope, a device (simulator/emulator/real device via device-qa), or both — asks the mode first in interactive runs, finds defects at failure boundaries, sad paths and error propagation paths (payments, webhooks, retries, concurrency, state machines, partial failure, external integrations), proves them with evidence, has them refuted by qa-skeptic, and reports defect cards. Use when asked to "QA", "break", "find failure modes in", or "run qa-run on" a feature, flow or path set.
+argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id>] [mode=code|device|both]"
 ---
 
 # qa-run — 장애 중심 QA 절차
@@ -24,6 +24,7 @@ argument-hint: "<scope: feature name and/or paths> [project=<name>] [run=<run-id
 - 네가 **호출한 세션**이면: 0단계를 하고, 1–6단계를 `qa-breaker`에게 맡기고(범위 파일 경로와 실행 폴더를 넘긴다), 결함 후보마다 `qa-skeptic`을 따로 불러 1차 반박을 받고, 보고 직전에 새 `qa-skeptic`으로 2차 반박을 다시 받은 뒤(7단계), 8–9단계를 한다.
 - 네가 **qa-breaker**이면: 1–6단계를 하고, 결함 후보 목록(5단계 형식 + 증거 위치)을 마지막 메시지로 돌려준다. 7단계 이후는 하지 않는다.
 - 평가 모드(프롬프트가 "evaluation mode"라고 하면): 읽기 전용, L0 증거까지, 파일을 쓰지 않고 마지막 메시지로만 답한다.
+- **모드 질문은 대화형 `/qa-run`의 호출한 세션만 한다**(0단계 첫 칸). 헤드리스 실행(`qa eval run`, `claude -p --agent qa-breaker`, 평가 모드)과 `qa-breaker`·`qa-skeptic`은 묻지 않는다: `scope.md`의 `mode`를 따르고, 없으면 `code`로 진행한다.
 
 ## 공통 규칙 (모든 단계)
 
@@ -49,6 +50,7 @@ propagation.md  4 전파 그래프
 backlog.md      5 가설 순위
 evidence/       6 증명(테스트·로그·seed)
 sandbox/        6 버리는 레포 사본
+evidence/<가설>/device/  6 기기 재현(캡처·녹화·로그, device 모드)
 skeptic.md      7 반박 결과(1차·2차, 결함마다)
 report.md       8 결함 카드 + 반박된 가설
 ```
@@ -56,6 +58,8 @@ report.md       8 결함 카드 + 반박된 가설
 ## 0. 안전 계약 (호출한 세션)
 
 `scope.md`를 쓴다. 비어 있는 칸이 있으면 사용자에게 묻고, 묻지 못하면 가장 안전한 값(로컬·읽기 전용)으로 정한다.
+- **모드(가장 먼저)**: 인자 `mode=`가 없으면 사용자에게 한 번 묻는다(AskUserQuestion, 선택지 셋). `code` — 코드·명세를 읽고 실패 테스트로 증명(L0–L5). `device` — 기기 화면에서 앱·기기 경계를 흔들어 재현(`LD`, [device-qa](../device-qa/SKILL.md)). `both` — 코드로 가설을 세우고 위험 상위 가설을 기기에서도 재현. 답을 `mode:`로 적는다. 묻지 못하는 실행(헤드리스·평가 모드)은 `code`.
+- **기기(모드 device·both)**: 플랫폼(iOS·Android), 가상/실기기(serial), 대상(URL 또는 앱 빌드 경로·버전, WebView 디버깅 여부), 로그인 방법(계정은 이름만), 허용 쓰기(테스트 결제 상한·만들 항목 표시 규칙), 금지 동작, 바꿀 기기 설정과 되돌리는 법. `python3 -I ~/.claude/skills/device-qa/scripts/device_qa.py doctor --platform <p>`와 `status --load` 결과를 적는다.
 - 대상: 레포 경로와 커밋, 기능·경로 범위, 위험 상위 흐름 3–5개.
 - 허용 환경: 로컬 / dev / 스테이징 중 무엇, 쓸 수 있는 테스트 계정·샌드박스 키의 **이름**(값은 쓰지 않음).
 - 실험마다: 영향 범위, 중단 조건, 되돌리는 법. 공유 환경을 깨뜨릴 수 있는 실험(서버 중단, DB 조작, 대량 요청)은 사람 승인 없이는 하지 않는다.
@@ -71,6 +75,7 @@ report.md       8 결함 카드 + 반박된 가설
 - **외부 호출마다**: 시간 초과, 재시도(횟수·간격·대상 오류), 멱등 키, 트랜잭션 안/밖, 실패 시 처리.
 - **되돌릴 수 없는 출구**: 청구·환불·발급·발송·외부 상태 변경.
 - 명세 위치(있으면): 기능별 수용 기준, 외부 API 문서의 재시도·웹훅 규칙.
+- **기기(모드 device·both)**: 앱 진입점(시작·복귀·딥링크·푸시), WebView↔네이티브 경계(외부 앱 스킴 처리, 오프라인 화면, 뒤로 가기), 결제·인증 앱 전환 경로, 권한 요청 시점. 화면 경로는 실제 기기에서 한 번 훑어 확인한다.
 
 ## 2. 기능 재설계 — 장애 설계 카드
 
@@ -85,6 +90,8 @@ report.md       8 결함 카드 + 반박된 가설
 2. **제어 동작 × STPA 4유형**: 안 함 / 해서 위험 / 때가 틀림 / 너무 일찍 멈추거나 너무 오래 감. 제어 동작 = 상태를 바꾸는 호출(청구, 취소, 발급, 환불, 만료 처리, 재시도).
 3. **의존 × 실패 모드**: 없음·느림·오류·틀린 값·중복·역순·일부만, 읽기와 쓰기를 따로.
 4. **대체 경로 비대칭**: 같은 결과를 내는 두 경로(신청 경로 둘, 결제 수단, 자동·수동 재시도, 사용자·관리자)를 나란히 놓고 정리·검증·쓰기 단계를 줄 단위로 비교한다. 한쪽에만 있는 정리·잠금·검증이 결함이 자주 숨는 자리다.
+
+5. **기기 경계 × 기기 안내어**(모드 device·both): [device-qa 4절](../device-qa/SKILL.md) 표의 경계(앱 전환·복귀, 네트워크, 뒤로 가기, 생명주기, 연타, 진입점, 권한, 외부 링크, 화면·입력, 시작)를 흐름의 각 단계에 대입한다.
 
 명세가 다룬 시나리오는 구현과 대조하고, **명세가 다루지 않은 교차 지점**(두 기능이나 두 실패가 겹치는 곳: 만료 작업 × 늦은 승인, 환불 × 발급 대기, 관리자 재시도 × 자동 재시도)을 새 가설로 본다.
 
@@ -119,11 +126,13 @@ report.md       8 결함 카드 + 반박된 가설
 | L3 | API 퍼징·두 계정 교차 접근(버리는 환경에서만) |
 | L4 | 장애 주입(Toxiproxy, WireMock·MSW, 프로세스 종료) |
 | L5 | 변이 테스트(결제·상태 모듈로 좁혀서) |
+| LD | 기기 재현: 실제 화면에서 재현(device-qa, 캡처·녹화·명령 출력, 재현 횟수) |
 
 - 확실히 깨지는 것은 실험 없이 L1 실패 테스트로 끝낸다. 높은 등급을 위해 시간을 쓰지 않는다.
 - 테스트는 **버리는 사본**에서: `git -C <repo> archive HEAD | tar -x -C <run>/sandbox`. 의존 설치가 필요하면 사본 안에서 하고(레포의 `node_modules`를 쓰려면 사본에 심볼릭 링크), 레포 자체는 건드리지 않는다.
 - 장애 주입 실험은 먼저 쓴다: 가설("{결함}이 생기면 시스템은 {완화}로 {불변식}을 지킨다"), 중단 조건, 되돌리는 법. 그다음 실행한다.
 - 증거는 `evidence/<가설 번호>/`에: 테스트 파일, 실행 명령, 출력(실패 확인), seed.
+- 기기 모드: 가설마다 [device-qa](../device-qa/SKILL.md) 2절 안전 규칙대로 잠그고, 5절 형식으로 `evidence/<가설>/device/`에 남긴다. 기기를 쓰는 동안 다른 증명과 기기를 나눠 쓰지 않는다(기기 하나에 owner 하나). 끝나면 `down`·`status []`, 바꾼 기기 설정 원상복구를 확인한다. both 모드에서 코드로 이미 L1인 가설은 사용자에게 보이는 실패가 다를 때만 기기에서도 재현한다.
 - 평가 모드에서는 L0까지만 한다.
 
 qa-breaker는 여기서 멈추고 결함 후보 목록을 돌려준다: 번호, 한 줄 요약, 가설 문장, 심각도(제안), **환경 가정·현실 빈도·심각도 근거**, 증거 등급, 증거 위치, 쓴 패턴 ID, 반박될 수 있는 이유(스스로 생각한 것).

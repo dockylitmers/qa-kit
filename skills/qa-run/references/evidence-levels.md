@@ -9,6 +9,7 @@
 | L2 속성 기반 상태 테스트 | 명령 모델, 깨진 최소 순서, seed | fast-check `fc.commands`, `fc.scheduler`(경쟁·순서) | seed와 경로를 기록해 재실행 가능하게 |
 | L3 API 퍼징·교차 접근 | 요청·응답 기록, 두 계정 교차 접근 결과 | Schemathesis(OpenAPI/Swagger), 직접 스크립트 | 버리는 로컬 환경에서만 |
 | L4 장애 주입 | 실험 계획(가설·중단 조건·되돌리기) + 결과 | Toxiproxy(DB·캐시·외부 API 앞 지연·끊김), WireMock·MSW(지연·빈 응답·깨진 응답), Playwright `route.abort`·`setOffline`·`clock`, 프로세스 종료 | 계획을 먼저 쓴다. 공유 환경은 승인 필요 |
+| LD 기기 재현 | 기기·OS·빌드, owner, 명령과 출력, 단계별 캡처·녹화, 재현 횟수, 바꾼 기기 설정과 복구 확인 | device-qa(시뮬레이터·에뮬레이터), 실기기는 Appium 직접 | 증거는 `evidence/<가설>/device/`. 재현 못 하면 L0로 남긴다 |
 | L5 변이 테스트 | 살아남은 변이 목록 | Stryker(결제·상태 모듈로 좁혀서) | 시간이 많이 든다. 테스트 공백을 보일 때만 |
 
 ## 버리는 사본

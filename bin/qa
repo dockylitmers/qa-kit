@@ -49,7 +49,7 @@ FAILURE_CLASS = {"boundary", "sad_path", "error_propagation", "concurrency"}
 SEVERITY = {"critical", "high", "medium", "low"}
 VERDICTS = {"accepted", "false_positive", "wont_fix", "duplicate"}
 REVIEW_VERDICTS = {"refuted", "stands", "downgraded", "uncertain"}
-EVIDENCE_LEVELS = {"L0", "L1", "L2", "L3", "L4", "L5"}
+EVIDENCE_LEVELS = {"L0", "L1", "L2", "L3", "L4", "L5", "LD"}  # LD: reproduced on a device (device-qa)
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 PATTERN_REQUIRED = [
     "id", "status", "tier", "failure_class", "title", "scope", "probe", "oracle",
@@ -826,7 +826,7 @@ def check_ledger(kb: Path, lf: Path, errors, warnings=None, pattern_ids=None):
             if ev.get("severity") not in SEVERITY:
                 errors.append(f"{where}:{n}: severity '{ev.get('severity')}' invalid")
             if ev.get("evidence") not in EVIDENCE_LEVELS:
-                errors.append(f"{where}:{n}: evidence '{ev.get('evidence')}' not in L0..L5")
+                errors.append(f"{where}:{n}: evidence '{ev.get('evidence')}' not in L0..L5, LD")
             if ev.get("id") in seen:
                 errors.append(f"{where}:{n}: duplicate finding id {ev.get('id')}")
             missing = [k for k in ("assumptions", "frequency", "severity_basis") if not ev.get(k)]
@@ -1372,7 +1372,7 @@ def cmd_finding(args):
         if args.severity not in SEVERITY:
             die(f"--severity must be one of {sorted(SEVERITY)}")
         if args.evidence not in EVIDENCE_LEVELS:
-            die("--evidence must be one of L0..L5")
+            die("--evidence must be one of L0..L5 or LD")
         if not (args.assumption and args.frequency and args.severity_basis):
             die("finding add needs --assumption (repeatable; 'none' if there is none), --frequency "
                 "and --severity-basis: severity is judged against realistic frequency and preconditions")
@@ -2107,6 +2107,7 @@ def eval_prompt(case: dict, patterns_dir=None) -> str:
         "",
         "Rules for this run:",
         "- Read-only: do not modify files, install dependencies or use the network.",
+        "- Mode: code. Do not ask which mode to run (code, device or both); this run is headless.",
         "- Follow the qa-run procedure, steps 1-6, at evidence level L0 (file:line code evidence).",
         "- Spend about a quarter of your effort outside known patterns.",
         "- Finish with a ranked list of at most 5 defect candidates. For each: title, location (file and "
@@ -2564,7 +2565,7 @@ def main(argv=None):
     p.add_argument("--run", help="run id, e.g. 2026-10-21-payments (list: omit for every run of the project)")
     p.add_argument("--title")
     p.add_argument("--severity", help="critical|high|medium|low (add: finder's; review: after refutation; judge: confirmed)")
-    p.add_argument("--evidence", help="L0..L5")
+    p.add_argument("--evidence", help="L0..L5 or LD (device)")
     p.add_argument("--class", dest="cls")
     p.add_argument("--location", help="file:line or file#function")
     p.add_argument("--patterns", help="comma-separated pattern ids")

@@ -180,6 +180,36 @@ class CliTests(unittest.TestCase):
         for leak in ("SECRET_LOCATION", "SECRET_SYMPTOM", "1234", "deadbeef"):
             self.assertNotIn(leak, prompt)
 
+    def test_headless_runs_default_to_code_mode(self):
+        # Headless runs (qa eval run, claude -p --agent qa-breaker) must never stop to ask the mode.
+        prompt = qa.eval_prompt({"id": "c1", "scope": {"feature": "refund", "paths": ["a/b.ts"]}})
+        self.assertIn("Mode: code", prompt)
+        self.assertIn("Do not ask which mode", prompt)
+        breaker = (KIT / "agents/qa-breaker.md").read_text()
+        self.assertIn("Never ask the user which mode", breaker)
+        self.assertIn("run in `code` mode", breaker)
+        run_skill = (KIT / "skills/qa-run/SKILL.md").read_text()
+        self.assertIn("없으면 `code`로 진행", run_skill)
+
+    def test_device_evidence_level_accepted(self):
+        kb = self.kb
+        self.assertEqual(cli(kb, "init", "demo")[0], 0)
+        code, out = cli(kb, "finding", "add", "--project", "demo", "--run", "r1", "--title", "result lost on return",
+                        "--severity", "high", "--evidence", "LD", *FINDING_CONTEXT)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cli(kb, "check")[0], 0)
+        code, out = cli(kb, "finding", "add", "--project", "demo", "--run", "r1", "--title", "x",
+                        "--severity", "low", "--evidence", "L9", *FINDING_CONTEXT)
+        self.assertNotEqual(code, 0)
+
+    def test_device_skill_is_client_neutral(self):
+        import re
+        bad = re.compile("work" + r"log|\b[DQTPBH]-[0-9a-f]{6}\b|\b(?:DP|SL|QA)-[A-Z]+-\d+\b", re.I)
+        for f in sorted((KIT / "skills/device-qa").rglob("*")):
+            if f.is_file() and f.suffix in (".md", ".py"):
+                hits = [m.group(0) for m in bad.finditer(f.read_text())]
+                self.assertEqual(hits, [], f"{f.relative_to(KIT)}: {hits}")
+
 
 def fake_gh(root: Path, issues) -> dict:
     """PATH with a fake read-only `gh` that prints `issues` as JSON for `gh issue list`."""

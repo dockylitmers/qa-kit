@@ -4,7 +4,8 @@
 
 | 구성 | 하는 일 |
 |---|---|
-| `skills/qa-run` | 절차: 0 안전 계약 → 1 정찰 → 2 기능 재설계(장애 설계 카드) → 3 위험 분석 → 4 전파 추적 → 5 가설 순위 → 6 증명 L0–L5 → 7 반박 검증 두 번(실행 중 건별 + 보고 직전 새 컨텍스트 건별) → 8 기존 이슈·결정 검색 + 결함 카드 보고 → 9 회고 기록 |
+| `skills/qa-run` | 절차: 0 모드 선택(코드만·기기만·둘 다, 대화형에서만 묻고 헤드리스는 코드) + 안전 계약 → 1 정찰 → 2 기능 재설계(장애 설계 카드) → 3 위험 분석 → 4 전파 추적 → 5 가설 순위 → 6 증명 L0–L5·LD(기기 재현) → 7 반박 검증 두 번(실행 중 건별 + 보고 직전 새 컨텍스트 건별) → 8 기존 이슈·결정 검색 + 결함 카드 보고 → 9 회고 기록 |
+| `skills/device-qa` | 기기 재현 도구(qa-run 6단계 `LD`): iOS 시뮬레이터·Android 에뮬레이터를 잠금·실제 터치 판정·캡처·녹화·권한 팝업 처리로 조작(`scripts/device_qa.py`), 기기 경계 대입표, 실기기는 Appium 직접 |
 | `skills/qa-retro` | 회고(수동 전용): 판정·반박된 가설·놓친 결함(`misses`)에서 패턴 변경을 항목 단위로 `proposals/`에 제안 |
 | `agents/qa-breaker` | 공격·증명(1–6단계). 외부 발송 도구 없음, 지식 저장소에 쓰지 않음, `qa-run` 미리 로드. 후보마다 환경 가정·현실 빈도·심각도 근거 필수 |
 | `agents/qa-skeptic` | 반박 검증(7단계). **결함 하나당 한 번** 불러 "사실이 아님"을 증명하려고 시도하고 빈도·선행 조건으로 심각도를 다시 잰다 |
@@ -31,8 +32,8 @@ qa doctor                                                  # 모든 항목 ok, �
 설치되는 것(모두 사용자 범위):
 
 ```
-~/.claude/skills/qa-run, qa-retro   -> qa-kit/skills/...
-~/.agents/skills/qa-run, qa-retro   -> qa-kit/skills/...   (Codex 등 같은 SKILL.md 형식을 읽는 도구용)
+~/.claude/skills/qa-run, qa-retro, device-qa   -> qa-kit/skills/...
+~/.agents/skills/qa-run, qa-retro, device-qa   -> qa-kit/skills/...   (Codex 등 같은 SKILL.md 형식을 읽는 도구용)
 ~/.claude/agents/qa-breaker.md, qa-skeptic.md -> qa-kit/agents/...
 ~/.local/bin/qa                     -> qa-kit/bin/qa
 ~/.claude/settings.json             env.QA_KB = <지식 저장소 경로>
@@ -49,6 +50,7 @@ Claude Code 세션에서:
 ```
 
 - 호출한 세션이 안전 계약(범위·환경·중단 조건)을 쓰고(`qa doctor --target <레포>`로 그 기기에서 할 수 있는 증명 등급을 먼저 확인), 1–6단계는 `qa-breaker`, 7단계는 `qa-skeptic`(1차: 실행 중 건별, 2차: 보고 직전 새 컨텍스트 건별)에게 맡기고, 기존 이슈·결정을 검색한 뒤(`qa issue search`) 결함 카드(영어 이슈 초안)와 반박된 가설 목록을 만든다.
+- 시작하면 무엇을 할지 묻는다: **코드만**(코드·명세로 가설, 실패 테스트로 증명), **기기만**(기기 화면에서 앱·기기 경계를 흔들어 재현), **둘 다**. 인자 `mode=code|device|both`를 주면 묻지 않는다. 기기 모드는 `python3 -I ~/.claude/skills/device-qa/scripts/device_qa.py doctor --platform all`이 통과해야 한다(설치: `skills/device-qa/references/setup.md`).
 - 산출물은 고객 레포 밖 실행 폴더 `${QA_WORK:-~/.qa-work}/<project>/<run-id>/`에 쓴다.
 - 이슈 게시·라벨·메시지는 하지 않는다. 사람이 승인 묶음으로 한다.
 
@@ -59,6 +61,8 @@ cd <project repo> && claude -p --agent qa-breaker \
   --append-system-prompt-file ~/.claude/skills/qa-run/SKILL.md \
   --add-dir="$HOME/.claude/skills/qa-run" "<scope>"
 ```
+
+헤드리스 실행은 모드를 묻지 않고 범위 파일의 `mode`(없으면 `code`)로 진행한다.
 
 `--agent`로 메인 스레드에서 돌릴 때는 에이전트의 `skills:` 미리 로드가 적용되지 않아(서브에이전트로 띄울 때만 적용) 절차를 직접 붙인다. `qa eval run`은 이렇게 한다.
 

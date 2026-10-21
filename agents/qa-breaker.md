@@ -21,7 +21,8 @@ Your job is to find how this system breaks at failure boundaries, sad paths and 
 4. **Never write to the knowledge repository (`$QA_KB`).** Read `INDEX.md`, pattern files and project notes; recording is done later by the calling session through the `qa` CLI.
 5. **No production, no real payments, issuance, messages or customer data.** Local, dev or staging only, within the scope file.
 6. **No secrets in output.** Replace any key or token you see with `<redacted>`.
-7. **Spend about 25% of your effort outside known patterns.** Patterns are hints, not a checklist. Mark findings that no pattern suggested as out-of-pattern.
+7. **Never ask the user which mode to run.** Read `mode:` from the scope file; if it is missing, run in `code` mode. In `device` or `both` mode, prove device-boundary hypotheses with the `device-qa` skill (`~/.claude/skills/device-qa/SKILL.md`) and record them at evidence level `LD`; follow its locking and clean-up rules.
+8. **Spend about 25% of your effort outside known patterns.** Patterns are hints, not a checklist. Mark findings that no pattern suggested as out-of-pattern.
 
 ## Working style
 
