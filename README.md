@@ -178,9 +178,10 @@ qa coverage check --project <p> --run <run> [--json]     # 빈칸·형식 오류
 ```
 
 - 표 파일: `${QA_WORK:-~/.qa-work}/<project>/<run>/coverage.md`(고객 레포 밖, `--file`로 바꿀 수 있음). 레포는 읽기만 한다.
-- 행은 코드에서 기계적으로 뽑는다: NestJS `@Controller` 접두사 + `@Get/@Post/@Put/@Patch/@Delete`(경로 상수는 레포 안 `const`에서 풂), 권한 데코레이터·가드(`@Permissions`, `@Roles`, `@UseGuards(…)`, `@Public`), 웹훅(경로·이름에 webhook·callback), `@Cron/@Interval/@Timeout`·`setInterval`·cron 라이브러리, `@OnEvent`, 큐(`@Processor`/`@Process`, `@EventPattern` …), Next.js `app/**/route.ts`·`pages/api`·`'use server'` 파일. 앱 전역 가드(`APP_GUARD`)와 경로 접두사는 머리말에 적힌다. 경로를 풀 수 없으면 `<dynamic:…>` 행과 경고가 나온다(손으로 고친다).
+- 행은 코드에서 기계적으로 뽑는다: NestJS `@Controller` 접두사 + `@Get/@Post/@Put/@Patch/@Delete`(경로 상수는 레포 안 `const`에서 풂), 권한 데코레이터·가드(`@Permissions`, `@Roles`, `@UseGuards(…)`, `@Public`), 웹훅(경로·이름에 webhook·callback), `@Cron/@Interval/@Timeout`·`setInterval`·cron 라이브러리, `@OnEvent`, 큐(`@Processor`/`@Process`, `@EventPattern` …), Next.js `app/**/route.ts`·`pages/api`·`'use server'` 파일. 앱·화면 진입점: `screen`(Expo Router 파일 라우트 — `_layout` 제외, `(그룹)` 제거, `[param]` 표기, `useLocalSearchParams`로 읽는 값은 `?param`; Next.js `app/**/page.*`·`pages/**`), `deeplink`(`app.json`·`app.config`·Info.plist·AndroidManifest의 스킴 × 화면 경로, 맞는 화면 없는 경로, `associatedDomains`·`intentFilters`, `Linking.addEventListener('url')`·`getInitialURL`·`useURL`), `push`(알림 응답 처리기 → 그 화면과 페이로드에서 읽는 목적지 필드 — 한 번 import한 파일까지; 수신 처리기), `external`(`Linking.openURL`·`WebBrowser`·`IntentLauncher`, WebView `onShouldStartLoadWithRequest`·`onMessage`·`onOpenWindow`, `AppState` 복귀). 앱 전역 가드(`APP_GUARD`)와 경로 접두사는 머리말에 적힌다. 경로를 풀 수 없으면 `<dynamic:…>` 행과 경고가 나온다(손으로 고친다).
 - 열은 점검 축 6개: `authz`(인가·객체 소유) · `dup`(재시도·더블 제출·멱등) · `conc`(경합·잠금·여러 탭·여러 인스턴스) · `abort`(부분 실패·외부 실패·시간 초과·종료) · `input`(경계·형식) · `audit`(기록·로그). 불변식 행은 `- I1: …` 줄에서 만든다(칸 하나).
-- 칸 값은 `checked: <증거 참조>` / `out_of_scope: <이유>` / `not_done: <이유>` 중 하나. `init`을 다시 돌려도 채운 칸과 행 id는 남는다.
+- 칸 값은 `checked: <증거 참조>` / `out_of_scope: <이유>` / `not_done: <이유>` 중 하나. `init`을 다시 돌려도 채운 칸과 행 id는 남는다. 종류별 축 해석(화면·딥링크·푸시에서 `abort` = 네트워크 끊김·백그라운드·프로세스 종료·앱 전환 등)은 qa-run 스킬 0단계 표.
+- **진입점 0행이면 `check` 실패.** 정말 진입점이 없는 범위만 `qa coverage set --empty-scope "<이유>"`로 통과하고, 이유가 report header에 나온다(행이 있는 표에 이 기록이 있으면 실패).
 - `check`는 분모(진입점 수·불변식 수)와 상태별 개수(행·축별)를 출력하고, 보고서 맨 위에 옮길 `report header` 줄을 준다. 행 상태: 축 하나라도 `not_done`이면 `not_done`, 아니면 하나라도 `checked`면 `checked`, 나머지는 `out_of_scope`. "권한 걸린 쓰기"는 권한·역할 데코레이터나 인증류 가드가 붙은 쓰기(기능 스위치 가드는 제외).
 
 **2. 심은 결함 시험 — 키트의 놓침률(정기)**

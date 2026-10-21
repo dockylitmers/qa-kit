@@ -932,5 +932,145 @@ class RecallCheckTests(unittest.TestCase):
         self.assertEqual([(c["title"], c["locs"]) for c in new], [("2. New race", [("src/c.ts", 5), ("src/c.ts", 40)])])
 
 
+APP_FILES = {
+    "apps/mobile/package.json": json.dumps({"dependencies": {"expo-router": "~5.0.0", "expo-notifications": "1"}}),
+    "apps/mobile/app.json": json.dumps({"expo": {
+        "scheme": "shopapp",
+        "ios": {"associatedDomains": ["applinks:shop.example.com"]},
+        "android": {"intentFilters": [{"action": "VIEW", "data": [{"scheme": "https", "host": "m.example.com",
+                                                                    "pathPrefix": "/open"}]}]}}}, indent=2),
+    "apps/mobile/src/app/_layout.tsx": "export default function RootLayout() { return null; }\n",
+    "apps/mobile/src/app/index.tsx": "export default function Home() { return null; }\n",
+    "apps/mobile/src/app/+not-found.tsx": "export default function NotFound() { return null; }\n",
+    "apps/mobile/src/app/(tabs)/_layout.tsx": "export default function Tabs() { return null; }\n",
+    "apps/mobile/src/app/(tabs)/orders/[orderId].tsx": (
+        "import { useLocalSearchParams } from 'expo-router';\n"
+        "export default function Order() {\n"
+        "  const { orderId } = useLocalSearchParams();\n  return null;\n}\n"),
+    "apps/mobile/src/app/pay-return.tsx": (
+        "import * as Notifications from 'expo-notifications';\n"
+        "import { AppState, Linking } from 'react-native';\n"
+        "import * as WebBrowser from 'expo-web-browser';\n"
+        "import { pushTarget } from '@/lib/push-target';\n\n"
+        "export default function PayReturn() {\n"
+        "  useEffect(() => {\n"
+        "    const sub = Notifications.addNotificationResponseReceivedListener((r) => {\n"
+        "      router.push(pushTarget(r.notification.request.content.data));\n"
+        "    });\n"
+        "    const app = AppState.addEventListener('change', onReturn);\n"
+        "    Linking.addEventListener('url', onUrl);\n"
+        "  }, []);\n"
+        "  const openTerms = () => WebBrowser.openBrowserAsync('https://example.com/terms');\n"
+        "  return <WebView onShouldStartLoadWithRequest={handleLoad} onMessage={onBridge} />;\n"
+        "}\n"),
+    "apps/mobile/src/lib/push-target.ts": (
+        "export function pushTarget(data: Record<string, string>) {\n"
+        "  return data.screen === 'order' ? `/orders/${data.orderId}` : '/';\n}\n"
+        "export async function openPayApp(url: string) {\n  await Linking.openURL(url);\n}\n"),
+    "apps/web/app/(shop)/products/[id]/page.tsx": "export default async function Product() { return null; }\n",
+    "apps/web/app/page.tsx": "export default function Home() { const s = await auth(); return null; }\n",
+    "apps/web/app/layout.tsx": "export default function Layout() { return null; }\n",
+    "apps/web/pages/legacy/index.tsx": "export default function Legacy() { return null; }\n",
+    "apps/web/pages/_app.tsx": "export default function App() { return null; }\n",
+    "apps/mobile/assets/readme.txt": "images only\n",
+}
+
+
+class AppEntryPointTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.kb = make_kb(self.root)
+        self.repo = self.root / "app"
+        for rel_path, text in APP_FILES.items():
+            f = self.repo / rel_path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
+        self.env = dict(os.environ, QA_WORK=str(self.root / "work"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self, *scope):
+        rows, _ = qa.extract_entry_points(self.repo, list(scope))
+        return rows
+
+    def test_expo_router_screens(self):
+        rows = [r for r in self.rows("apps/mobile/src") if r["kind"] == "screen"]
+        self.assertEqual(sorted(r["route"] for r in rows),
+                         ["/", "/+not-found", "/orders/[orderId] ?orderId", "/pay-return"])  # groups and layouts gone
+        self.assertEqual(next(r for r in rows if r["route"] == "/")["location"], "apps/mobile/src/app/index.tsx:1")
+
+    def test_deeplinks_from_scheme_and_link_config(self):
+        rows = [r for r in self.rows("apps/mobile/src") if r["kind"] == "deeplink"]
+        routes = {r["route"] for r in rows}
+        for want in ("shopapp://", "shopapp://orders/[orderId]?orderId=", "shopapp://pay-return",
+                     "shopapp://<unmatched path>", "https://shop.example.com/*", "https://m.example.com/open*",
+                     "PayReturn Linking.addEventListener"):
+            self.assertIn(want, routes)
+        self.assertTrue(next(r for r in rows if r["route"] == "shopapp://")["location"].startswith("apps/mobile/app.json:"))
+
+    def test_push_handler_destination_fields(self):
+        push = [r for r in self.rows("apps/mobile/src") if r["kind"] == "push"]
+        self.assertEqual(len(push), 1)
+        self.assertEqual(push[0]["method"], "RESPONSE")
+        self.assertIn("PayReturn addNotificationResponseReceivedListener → /pay-return", push[0]["route"])
+        self.assertIn("[data: screen, orderId]", push[0]["route"])  # read one import away
+
+    def test_external_hand_offs(self):
+        ext = {(r["method"], r["route"]) for r in self.rows("apps/mobile/src") if r["kind"] == "external"}
+        self.assertIn(("OPEN", "PayReturn WebBrowser.openBrowserAsync"), ext)
+        self.assertIn(("OPEN", "openPayApp Linking.openURL"), ext)
+        self.assertIn(("INTERCEPT", "pay-return WebView onShouldStartLoadWithRequest → handleLoad"), ext)
+        self.assertIn(("BRIDGE", "pay-return WebView onMessage → onBridge"), ext)
+        self.assertIn(("RETURN", "PayReturn AppState change (return from another app)"), ext)
+
+    def test_next_pages(self):
+        pages = {(r["route"], r["auth"]) for r in self.rows("apps/web") if r["kind"] == "screen"}
+        self.assertEqual(pages, {("/products/[id]", "-"), ("/", "session"), ("/legacy", "-")})
+
+    def test_empty_scope_fails_unless_recorded(self):
+        cov = self.root / "cov.md"
+        code, out = cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo),
+                            "--scope", "apps/mobile/assets", "--file", str(cov))
+        self.assertEqual(code, 0, out)
+        self.assertIn("no entry points found", out)
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 1, out)
+        self.assertIn("an empty denominator is not a pass", out)
+        self.assertEqual(cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--empty-scope", " ")[0], 1)
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--empty-scope", "assets only, no code")
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 0, out)
+        self.assertIn("all entry points 0 (empty scope: assets only, no code)", out)
+        # the reason survives a re-init; a table with rows cannot also claim to be empty
+        cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo), "--scope", "apps/mobile/assets",
+                "--file", str(cov))
+        self.assertEqual(cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))[0], 0)
+        full = self.root / "full.md"
+        cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo), "--scope", "apps/mobile/src",
+                "--file", str(full))
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(full), "--rows", "E001-E099",
+                "--out-of-scope", "test")
+        self.assertEqual(cli_env(self.kb, self.env, "coverage", "check", "--file", str(full))[0], 0)
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(full), "--empty-scope", "nothing here")
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(full))
+        self.assertEqual(code, 1, out)
+        self.assertIn("empty scope recorded (nothing here) but the table has", out)
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertIn("report header:", out)
+
+    def test_report_header_counts_client_kinds(self):
+        cov = self.root / "cov.md"
+        cli_env(self.kb, self.env, "coverage", "init", "--repo", str(self.repo), "--scope", "apps/mobile/src",
+                "--file", str(cov))
+        cli_env(self.kb, self.env, "coverage", "set", "--file", str(cov), "--rows", "E001-E099",
+                "--out-of-scope", "test")
+        code, out = cli_env(self.kb, self.env, "coverage", "check", "--file", str(cov))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"client entry points \d+ \(screen 4, deeplink 7, push 1, external 5\)")
+        self.assertNotIn("permission-guarded write", out.split("report header:")[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

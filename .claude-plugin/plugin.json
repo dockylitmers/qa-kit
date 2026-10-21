@@ -1,6 +1,6 @@
 {
   "name": "qa-kit",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Failure-focused QA agent kit: qa-run, qa-retro and device-qa skills, qa-breaker and qa-skeptic subagents, and the qa CLI for patterns, run ledgers and replay evals, and recall checks (coverage gate, seeded defects, blind re-derivation).",
   "author": {
     "name": "dockylitmers"

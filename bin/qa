@@ -38,7 +38,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 KIT_DIR = Path(__file__).resolve().parent.parent
 HOME = Path(os.path.expanduser("~"))
 KB_REMOTE_SLUG = "dockylitmers/qa-knowledge"
@@ -2708,6 +2708,341 @@ NEXT_REEXPORT_RE = re.compile(r"export\s*\{([^}]*)\}")
 SESSION_CALL_RE = re.compile(r"\b(getServerSession|auth|currentUser|requireAuth|withAuth|getSession|requireUser)\s*\(")
 
 
+# App entry points (screens, deep links, push, external hand-offs)
+SCREEN_EXTS = {".tsx", ".ts", ".jsx", ".js"}
+NEXT_PAGE_RE = re.compile(r"(?:^|/)app/(?:(.*)/)?page\.(?:tsx|jsx|ts|js|mdx)$")
+NEXT_PAGES_RE = re.compile(r"(?:^|/)pages/(?!api/)(.*)\.(?:tsx|jsx|ts|js)$")
+PUSH_RESPONSE_RE = re.compile(
+    r"\b(addNotificationResponseReceivedListener|useLastNotificationResponse|getLastNotificationResponseAsync|"
+    r"onNotificationOpenedApp|getInitialNotification|onNotificationOpened|onNotification)\s*\(")
+PUSH_RECEIVE_RE = re.compile(
+    r"\b(addNotificationReceivedListener|setNotificationHandler|setBackgroundMessageHandler|"
+    r"onForegroundEvent|onBackgroundEvent|messaging\(\)\s*\.\s*onMessage)\s*\(")
+NAV_CALL_RE = re.compile(r"\b(?:router|navigation|Router)\.(?:push|replace|navigate|dismissTo)\s*\(\s*"
+                         r"(?:\{\s*pathname\s*:\s*)?(['\"`])(/[^'\"`]*)\1")
+EXTERNAL_RE = re.compile(
+    r"\b(Linking\.openURL|Linking\.sendIntent|Linking\.openSettings|WebBrowser\.openBrowserAsync|"
+    r"WebBrowser\.openAuthSessionAsync|openBrowserAsync|openAuthSessionAsync|IntentLauncher\.startActivityAsync|"
+    r"InAppBrowser\.open)\s*\(")
+WEBVIEW_HOOK_RE = re.compile(r"\b(onShouldStartLoadWithRequest|onOpenWindow|onMessage)\s*=\s*\{")
+APP_RETURN_RE = re.compile(r"\bAppState\.addEventListener\s*\(\s*(['\"])change\1")
+LINK_HANDLER_RE = re.compile(r"\b(Linking\.addEventListener\s*\(\s*(['\"])url\2|Linking\.getInitialURL|"
+                             r"Linking\.useURL|useURL|useLinkingURL)\s*\(?")
+DATA_FIELD_RE = re.compile(r"\bdata\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)|\bdata\s*\[\s*(['\"])(\w+)\2|"
+                           r"\(\s*data\s*,\s*(['\"])(\w+)\4")
+SEARCH_PARAMS_RE = re.compile(r"use(?:Local|Global)SearchParams\s*(?:<\s*\{([^}]*)\}\s*>)?\s*\(")
+
+
+def nearest_file(repo: Path, rel_dir: str, names):
+    """First of `names` in rel_dir or its ancestors up to the repo root (repo-relative path)."""
+    d = Path(rel_dir)
+    while True:
+        for n in names:
+            if (repo / d / n).is_file():
+                return str(d / n) if str(d) != "." else n
+        if str(d) in (".", ""):
+            return None
+        d = d.parent
+
+
+def package_has(repo: Path, rel_path: str, dep: str) -> bool:
+    pkg = nearest_file(repo, str(Path(rel_path).parent), ["package.json"])
+    if not pkg:
+        return False
+    try:
+        data = json.loads((repo / pkg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return any(dep in (data.get(k) or {}) for k in ("dependencies", "devDependencies", "peerDependencies"))
+
+
+def expo_router_root(repo: Path, rel_path: str):
+    """The Expo Router `app/` folder holding rel_path (it has a `_layout` file and expo-router is a dependency)."""
+    parts = Path(rel_path).parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] != "app":
+            continue
+        root = Path(*parts[:i + 1])
+        if any((repo / root / f"_layout{e}").is_file() for e in SCREEN_EXTS) and package_has(repo, str(root), "expo-router"):
+            return str(root)
+    return None
+
+
+def expo_route(rel_in_app: str):
+    """Expo Router file route: groups dropped, index folded, [param] kept. None for layouts and special files."""
+    p = Path(rel_in_app)
+    stem = p.name[:-len(p.suffix)] if p.suffix else p.name
+    if stem.startswith("_") or stem == "+html" or stem.startswith("+native-intent"):
+        return None
+    segs = [x for x in p.parent.parts if not (x.startswith("(") and x.endswith(")"))]
+    if stem != "index" and not (stem.startswith("(") and stem.endswith(")")):
+        segs.append(stem)
+    return join_route(*segs)
+
+
+def default_export_line(sf: "SourceFile") -> int:
+    m = re.search(r"export\s+default\b", sf.masked)
+    return sf.line(m.start()) if m else 1
+
+
+def screen_params(sf: "SourceFile"):
+    keys = []
+    for m in SEARCH_PARAMS_RE.finditer(sf.masked):
+        if m.group(1):
+            keys += re.findall(r"([A-Za-z_$][\w$]*)\??\s*:", m.group(1))
+        else:  # const { a, b } = useLocalSearchParams()
+            d = re.search(r"\{([^{}]*)\}\s*=\s*$", sf.masked[max(0, m.start() - 200):m.start()])
+            if d:
+                keys += re.findall(r"([A-Za-z_$][\w$]*)", d.group(1))
+    return list(dict.fromkeys(keys))
+
+
+def resolve_import(repo: Path, from_rel: str, spec: str):
+    """Repo-relative file an import specifier points at (relative paths and @/ ~/ aliases), or None."""
+    bases = []
+    if spec.startswith("."):
+        bases.append(Path(from_rel).parent / spec)
+    elif spec[:2] in ("@/", "~/"):
+        pkg = nearest_file(repo, str(Path(from_rel).parent), ["package.json"])
+        root = Path(pkg).parent if pkg else Path(".")
+        bases += [root / "src" / spec[2:], root / spec[2:]]
+    for b in bases:
+        b = Path(os.path.normpath(str(b)))
+        for cand in [b] + [b.with_name(b.name + e) for e in SCREEN_EXTS] + [b / f"index{e}" for e in SCREEN_EXTS]:
+            if (repo / cand).is_file():
+                return str(cand)
+    return None
+
+
+def push_data_fields(repo: Path, sf: "SourceFile"):
+    """Destination fields a push handler reads from the payload, here and one import away."""
+    def fields(text):
+        out = []
+        for m in DATA_FIELD_RE.finditer(text):
+            out.append(m.group(1) or m.group(3) or m.group(5))
+        return out
+
+    found = fields(sf.text)
+    callees = []
+    for dm in re.finditer(r"\.data\b", sf.masked):  # the calls (innermost two) that receive `.data`
+        depth, k, found_here = 0, dm.start(), 0
+        while k > 0 and found_here < 2:
+            k -= 1
+            c = sf.masked[k]
+            if c == ")":
+                depth += 1
+            elif c == "(":
+                if depth == 0:
+                    nm = re.search(r"([A-Za-z_$][\w$]*)\s*$", sf.masked[max(0, k - 80):k])
+                    if nm:
+                        callees.append(nm.group(1))
+                    found_here += 1
+                else:
+                    depth -= 1
+            elif c in ";{}" and depth == 0:
+                break
+    for name in dict.fromkeys(callees):
+        im = re.search(r"import\s*\{[^}]*\b" + re.escape(name) + r"\b[^}]*\}\s*from\s*(['\"])([^'\"]+)\1", sf.text)
+        target = resolve_import(repo, sf.rel, im.group(2)) if im else None
+        if target:
+            try:
+                found += fields((repo / target).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    skip = {"content", "request", "notification", "data", "length", "trim", "toString"}
+    return [f for f in dict.fromkeys(found) if f and f not in skip]
+
+
+TOP_DECL_RE = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|class\s+|"
+                         r"(?:const|let|var)\s+)([A-Za-z_$][\w$]*)", re.M)
+
+
+def enclosing_or_file(sf: "SourceFile", idx: int) -> str:
+    """The top-level declaration holding idx (component, function, class), or the file name at top level."""
+    pre = sf.masked[:idx]
+    if pre.count("{") - pre.count("}") <= 0:
+        return Path(sf.rel).stem
+    name = None
+    for m in TOP_DECL_RE.finditer(pre):
+        name = m.group(1)
+    return name or Path(sf.rel).stem
+
+
+SCHEME_KEY_RE = r'"scheme"'
+
+
+def app_config(repo: Path, scope):
+    """Schemes, universal-link domains and Android link hosts from app.json / app.config / native files."""
+    found = {"schemes": [], "domains": [], "hosts": [], "location": None}
+    cfg_files = set()
+    for sp in scope:
+        f = nearest_file(repo, sp, ["app.json", "app.config.ts", "app.config.js"])
+        if f:
+            cfg_files.add(f)
+        base = repo / sp
+        if base.is_dir():
+            for name in ("app.json", "app.config.ts", "app.config.js", "Info.plist", "AndroidManifest.xml"):
+                for g in base.rglob(name):
+                    if not any(x in TARGET_SKIP_DIRS for x in g.relative_to(repo).parts):
+                        cfg_files.add(str(g.relative_to(repo)))
+            for g in base.rglob("*.entitlements"):
+                cfg_files.add(str(g.relative_to(repo)))
+    for f in sorted(cfg_files):
+        try:
+            t = (repo / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        line = lambda pat: t[:m.start()].count("\n") + 1 if (m := re.search(pat, t)) else 1  # noqa: E731
+        if f.endswith("app.json"):
+            try:
+                data = json.loads(t)
+            except ValueError:
+                continue
+            ex = data.get("expo", data)
+            sch = ex.get("scheme")
+            for x in ([sch] if isinstance(sch, str) else sch or []):
+                found["schemes"].append((x, f"{f}:{line(SCHEME_KEY_RE)}"))
+            for d in ((ex.get("ios") or {}).get("associatedDomains") or []):
+                if str(d).startswith("applinks:"):
+                    found["domains"].append((d.split(":", 1)[1], f"{f}:{line(r'associatedDomains')}"))
+            for flt in ((ex.get("android") or {}).get("intentFilters") or []):
+                for dd in (flt.get("data") or []) if isinstance(flt.get("data"), list) else [flt.get("data") or {}]:
+                    if dd.get("host"):
+                        found["hosts"].append((f"{dd.get('scheme', 'https')}://{dd['host']}{dd.get('pathPrefix', '')}",
+                                               f"{f}:{line(r'intentFilters')}"))
+        elif f.endswith((".ts", ".js")):
+            for m in re.finditer(r"\bscheme\s*:\s*(['\"])([\w.+-]+)\1", t):
+                found["schemes"].append((m.group(2), f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+            for m in re.finditer(r"applinks:([\w.-]+)", t):
+                found["domains"].append((m.group(1), f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+        elif f.endswith("Info.plist"):
+            for m in re.finditer(r"<key>CFBundleURLSchemes</key>\s*<array>(.*?)</array>", t, re.S):
+                for x in re.findall(r"<string>([^<]+)</string>", m.group(1)):
+                    found["schemes"].append((x, f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+        elif f.endswith(".entitlements"):
+            for m in re.finditer(r"applinks:([\w.-]+)", t):
+                found["domains"].append((m.group(1), f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+        elif f.endswith("AndroidManifest.xml"):
+            for m in re.finditer(r"<data\b[^>]*android:scheme=\"([^\"]+)\"[^>]*?(?:android:host=\"([^\"]+)\")?", t):
+                if m.group(1) in ("http", "https") and m.group(2):
+                    found["hosts"].append((f"{m.group(1)}://{m.group(2)}", f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+                elif m.group(1) not in ("http", "https"):
+                    found["schemes"].append((m.group(1), f"{f}:{t[:m.start()].count(chr(10)) + 1}"))
+    for k in ("schemes", "domains", "hosts"):
+        found[k] = list(dict.fromkeys(found[k]))
+    return found
+
+
+def code_matches(pattern, sf: "SourceFile"):
+    """Matches on the real text (string arguments matter) that do not start inside a comment or string."""
+    return [m for m in pattern.finditer(sf.text) if sf.masked[m.start()] == sf.text[m.start()]]
+
+
+def app_rows(repo: Path, sf: "SourceFile", rel_path: str):
+    """screen, push and external rows of one file (deep links are added per app afterwards)."""
+    rows = []
+    loc = lambda line: f"{rel_path}:{line}"  # noqa: E731
+    ext = Path(rel_path).suffix
+    root = expo_router_root(repo, rel_path) if ext in SCREEN_EXTS and "/app/" in f"/{rel_path}" else None
+    if root:
+        rel_in = str(Path(rel_path).relative_to(root))
+        if Path(rel_in).stem.endswith("+api"):
+            route = expo_route(rel_in.replace("+api", ""))
+            for mm in NEXT_METHOD_RE.finditer(sf.masked):
+                rows.append({"kind": "http", "method": mm.group(1), "route": route, "auth": "-",
+                             "location": loc(sf.line(mm.start())), "handler": "api route"})
+        else:
+            route = expo_route(rel_in)
+            if route is not None:
+                params = screen_params(sf)
+                rows.append({"kind": "screen", "method": "SCREEN",
+                             "route": route + (f" ?{','.join(params)}" if params else ""),
+                             "auth": "-", "location": loc(default_export_line(sf)), "handler": "expo-router",
+                             "app_root": root, "path": route, "params": params})
+    else:
+        nm = NEXT_PAGE_RE.search(rel_path)
+        pm = NEXT_PAGES_RE.search(rel_path)
+        if nm or pm:
+            if nm:
+                segs = [x for x in (nm.group(1) or "").split("/")
+                        if x and not (x.startswith("(") and x.endswith(")")) and not x.startswith("@")]
+                route = join_route(*segs)
+            else:
+                stem = pm.group(1)
+                route = None if Path(stem).name.startswith("_") else join_route(re.sub(r"(^|/)index$", "", stem))
+            if route is not None:
+                rows.append({"kind": "screen", "method": "PAGE", "route": route,
+                             "auth": "session" if SESSION_CALL_RE.search(sf.masked) else "-",
+                             "location": loc(default_export_line(sf)), "handler": "page"})
+    # push: tapping a notification (response) or receiving one
+    resp = list(PUSH_RESPONSE_RE.finditer(sf.masked))
+    recv = list(PUSH_RECEIVE_RE.finditer(sf.masked))
+    if resp or recv:
+        navs = list(dict.fromkeys(m.group(2) for m in NAV_CALL_RE.finditer(sf.text)))
+        on = route if root and route is not None else None
+        navs = [d for d in navs if d != on]
+        fields = push_data_fields(repo, sf)
+        here = (f" → {on}" if on else "") + (f" (file also opens {', '.join(navs)})" if navs else "")
+        data = f" [data: {', '.join(fields)}]" if fields else ""
+        for m in resp:
+            rows.append({"kind": "push", "method": "RESPONSE",
+                         "route": f"{enclosing_or_file(sf, m.start())} {m.group(1)}{here}{data}",
+                         "auth": "-", "location": loc(sf.line(m.start())), "handler": m.group(1)})
+        for m in recv:
+            rows.append({"kind": "push", "method": "RECEIVE",
+                         "route": f"{enclosing_or_file(sf, m.start())} {''.join(m.group(1).split())}",
+                         "auth": "-", "location": loc(sf.line(m.start())), "handler": m.group(1)})
+    # external: open another app or browser, WebView hand-offs, return from another app
+    counts = {}
+    for m in EXTERNAL_RE.finditer(sf.masked):
+        fn = enclosing_or_file(sf, m.start())
+        counts[(fn, m.group(1))] = counts.get((fn, m.group(1)), 0) + 1
+        n = counts[(fn, m.group(1))]
+        rows.append({"kind": "external", "method": "OPEN",
+                     "route": f"{fn} {m.group(1)}" + (f" #{n}" if n > 1 else ""),
+                     "auth": "-", "location": loc(sf.line(m.start())), "handler": fn})
+    for m in WEBVIEW_HOOK_RE.finditer(sf.masked):
+        meth = "BRIDGE" if m.group(1) == "onMessage" else "INTERCEPT"
+        val = re.match(r"\s*([A-Za-z_$][\w$.]*)", sf.masked[m.end():])
+        rows.append({"kind": "external", "method": meth,
+                     "route": f"{Path(rel_path).stem} WebView {m.group(1)}" + (f" → {val.group(1)}" if val else ""),
+                     "auth": "-", "location": loc(sf.line(m.start())), "handler": m.group(1)})
+    for m in code_matches(APP_RETURN_RE, sf):
+        rows.append({"kind": "external", "method": "RETURN",
+                     "route": f"{enclosing_or_file(sf, m.start())} AppState change (return from another app)",
+                     "auth": "-", "location": loc(sf.line(m.start())), "handler": "AppState"})
+    # deep-link handlers in code
+    for m in code_matches(LINK_HANDLER_RE, sf):
+        name = re.sub(r"\s+|\(.*", "", m.group(1))
+        rows.append({"kind": "deeplink", "method": "HANDLER", "route": f"{enclosing_or_file(sf, m.start())} {name}",
+                     "auth": "-", "location": loc(sf.line(m.start())), "handler": name})
+    return rows
+
+
+def deeplink_rows(repo: Path, scope, rows):
+    """One row per (scheme x screen route) of each Expo Router app, an unmatched-path row per scheme, and
+    one row per universal-link domain or Android link host."""
+    cfg = app_config(repo, scope)
+    out = []
+    screens = [r for r in rows if r["kind"] == "screen" and r.get("handler") == "expo-router"
+               and not r["path"].endswith("/+not-found")]  # unknown paths get one `<unmatched path>` row
+    if screens or any(r["kind"] in ("push", "external") for r in rows):
+        for scheme, where in cfg["schemes"]:
+            for r in screens:
+                q = "".join(f"?{p}=" if i == 0 else f"&{p}=" for i, p in enumerate(r.get("params") or []))
+                out.append({"kind": "deeplink", "method": "SCHEME", "route": f"{scheme}://{r['path'].lstrip('/')}{q}",
+                            "auth": "-", "location": where, "handler": r["location"]})
+            out.append({"kind": "deeplink", "method": "SCHEME", "route": f"{scheme}://<unmatched path>",
+                        "auth": "-", "location": where, "handler": "not-found"})
+        for dom, where in cfg["domains"]:
+            out.append({"kind": "deeplink", "method": "UNIVERSAL", "route": f"https://{dom}/*", "auth": "-",
+                        "location": where, "handler": "associatedDomains"})
+        for host, where in cfg["hosts"]:
+            out.append({"kind": "deeplink", "method": "APPLINK", "route": f"{host}*", "auth": "-",
+                        "location": where, "handler": "intentFilters"})
+    return out
+
+
 class Deco:
     def __init__(self, name, args, line, start, end):
         self.name, self.args, self.line, self.start, self.end = name, args, line, start, end
@@ -2886,6 +3221,8 @@ def extract_entry_points(repo: Path, scope):
             name = f"{owner + '.' if owner else ''}{target.group(1) if target else '?'}"
             rows.append({"kind": "schedule", "method": "TIMER", "route": f"{name} [{m.group(1).split()[-1]}]",
                          "auth": "-", "location": loc(sf.line(m.start())), "handler": name})
+        # screens (Expo Router, Next.js pages), push handlers, external hand-offs, deep-link handlers
+        rows += app_rows(repo, sf, rel_path)
         # Next.js route handlers, pages/api routes and server actions
         nm = NEXT_ROUTE_RE.search(rel_path)
         pm = NEXT_PAGES_API_RE.search(rel_path)
@@ -2912,7 +3249,11 @@ def extract_entry_points(repo: Path, scope):
             for am in re.finditer(r"export\s+(?:async\s+function\s+|const\s+)([A-Za-z_$][\w$]*)", sf.masked):
                 rows.append({"kind": "action", "method": "ACTION", "route": f"{rel_path}#{am.group(1)}",
                              "auth": session, "location": loc(sf.line(am.start())), "handler": am.group(1)})
-    order = {"http": 0, "webhook": 1, "action": 2, "schedule": 3, "event": 4, "queue": 5}
+    rows += deeplink_rows(repo, scope, rows)
+    for r in rows:
+        for k in ("app_root", "path", "params"):
+            r.pop(k, None)
+    order = {k: i for i, k in enumerate(ENTRY_KINDS)}
     rows.sort(key=lambda r: (order.get(r["kind"], 9), r["route"], r["method"]))
     seen, uniq = set(), []
     for r in rows:
@@ -2957,6 +3298,9 @@ COVERAGE_AXIS_HELP = {
     "audit": "audit records and logs",
 }
 COVERAGE_STATES = ["checked", "out_of_scope", "not_done"]
+ENTRY_KINDS = ["http", "webhook", "action", "screen", "deeplink", "push", "external", "schedule", "event", "queue"]
+APP_KINDS = {"screen", "deeplink", "push", "external"}
+EMPTY_SCOPE_RE = re.compile(r"^- empty scope:\s*(.*)$")
 COVERAGE_CELL_RE = re.compile(r"^(checked|out_of_scope|not_done):\s*(\S.*)$")
 ENTRY_COLS = ["id", "kind", "method", "route", "auth", "location"] + COVERAGE_AXES
 INV_COLS = ["id", "invariant", "source", "check"]
@@ -3065,7 +3409,13 @@ def entry_group(r) -> str:
         if r["method"] in READ_METHODS:
             return "reads"
         return "permission-guarded writes" if is_guarded(r) else "other writes"
+    if r["kind"] in APP_KINDS:
+        return "client entry points"
     return "jobs, events, queues, actions"
+
+
+ENTRY_GROUPS = ["permission-guarded writes", "other writes", "reads", "client entry points",
+                "jobs, events, queues, actions"]
 
 
 def row_status(cells):
@@ -3089,9 +3439,10 @@ def cmd_coverage(args):
         guards, prefix = repo_globals(repo)
         head = run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"]).stdout.strip() or "?"
         dirty = run(["git", "-C", str(repo), "status", "--porcelain"]).stdout.strip()
-        old_e, old_i = {}, {}
+        old_e, old_i, old_empty = {}, {}, []
         if out.exists():
-            _, oe, oi, _ = read_coverage(out)
+            oh, oe, oi, _ = read_coverage(out)
+            old_empty = [h for h in oh if EMPTY_SCOPE_RE.match(h)]
             old_e = {f"{r['kind']} {r['method']} {r['route']}": r for r in oe}
             old_i = {r["invariant"]: r for r in oi}
         used = {r["id"] for r in old_e.values()}
@@ -3133,7 +3484,7 @@ def cmd_coverage(args):
             f"; route prefix: {('/' + prefix.strip('/')) if prefix else 'none'}",
             "- axes: " + " · ".join(f"`{a}` {COVERAGE_AXIS_HELP[a]}" for a in COVERAGE_AXES),
             "- every cell: `checked: <evidence ref>` · `out_of_scope: <reason>` · `not_done: <reason>`",
-        ]
+        ] + old_empty
         out.parent.mkdir(parents=True, exist_ok=True)
         write_coverage(out, header, entries, invs)
         groups = {}
@@ -3145,7 +3496,7 @@ def cmd_coverage(args):
         print(f"{out}")
         print(f"{len(entries)} entry points ({', '.join(f'{k} {v}' for k, v in kinds.items()) or 'none'}), "
               f"{len(invs)} invariants, {len(entries) * len(COVERAGE_AXES) + len(invs)} cells to fill")
-        for g in ("permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"):
+        for g in ENTRY_GROUPS:
             print(f"  {g:<32} {groups.get(g, 0)}")
         if dropped:
             print(f"note: {len(dropped)} row(s) from the previous table no longer match the code and were dropped: "
@@ -3153,13 +3504,24 @@ def cmd_coverage(args):
         for n in notes:
             print(f"warning: {n}", file=sys.stderr)
         if not entries:
-            print("warning: no entry points found — check --scope", file=sys.stderr)
+            print("warning: no entry points found — `qa coverage check` fails until --scope is fixed or "
+                  "the scope is recorded as empty with `qa coverage set --empty-scope \"<reason>\"`", file=sys.stderr)
         return 0
 
     path = coverage_file_arg(args)
     if not path.exists():
         die(f"no coverage file at {path}; run `qa coverage init` first")
     header, entries, invs, problems = read_coverage(path)
+
+    if args.action == "set" and args.empty_scope is not None:
+        reason = " ".join(args.empty_scope.split())
+        if not reason:
+            die("--empty-scope needs a reason (why this scope has no entry points)")
+        header = [h for h in header if not EMPTY_SCOPE_RE.match(h)] + [f"- empty scope: {reason}"]
+        write_coverage(path, header, entries, invs)
+        print(f"recorded empty scope: {reason}" + (f" (but the table has {len(entries)} entry points: "
+                                                   "`qa coverage check` will fail)" if entries else ""))
+        return 0
 
     if args.action == "set":
         values = [(s, v) for s, v in (("checked", args.checked), ("out_of_scope", args.out_of_scope),
@@ -3237,13 +3599,18 @@ def cmd_coverage(args):
     dups = sorted({i for i in ids if ids.count(i) > 1})
     if dups:
         bad_cells.append(f"duplicate row ids: {', '.join(dups)}")
-    if not entries and not invs:
-        bad_cells.append("no rows: run `qa coverage init` with the run's scope")
+    empty = next((m.group(1).strip() for h in header if (m := EMPTY_SCOPE_RE.match(h))), None)
+    if not entries and not empty:
+        bad_cells.insert(0, "no entry points: an empty denominator is not a pass — fix --scope and run "
+                         "`qa coverage init` again, or record why the scope truly has none with "
+                         "`qa coverage set --empty-scope \"<reason>\"`")
+    if entries and empty is not None:
+        bad_cells.insert(0, f"empty scope recorded ({empty}) but the table has {len(entries)} entry points")
 
     def fmt(c):
         return ", ".join(f"{s} {c[s]}" for s in COVERAGE_STATES) + (f", blank {c['blank']}" if c["blank"] else "")
 
-    summary = {"file": str(path), "entry_points": len(entries), "invariants": len(invs),
+    summary = {"file": str(path), "entry_points": len(entries), "invariants": len(invs), "empty_scope": empty,
                "groups": groups, "axes": axis_counts, "invariant_cells": inv_counts,
                "problems": bad_cells, "pass": not bad_cells}
     if args.json:
@@ -3253,17 +3620,28 @@ def cmd_coverage(args):
     print(f"coverage: {path}")
     print(f"denominator: {len(entries)} entry points, {len(invs)} invariants")
     print("rows (a row is not_done if any axis is, checked if any axis is checked, else out_of_scope):")
-    for g in ("permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"):
+    for g in ENTRY_GROUPS:
         if g in groups:
             print(f"  {g:<32} {sum(groups[g].values()):>4} — {fmt(groups[g])}")
     print(f"  {'invariants':<32} {len(invs):>4} — {fmt(inv_counts)}")
     print("cells by axis:")
     for a in COVERAGE_AXES:
         print(f"  {a:<6} {fmt(axis_counts[a])}")
-    print("report header: "
-          f"permission-guarded write entry points {sum(gw.values())}: {fmt(gw)}; "
-          f"all entry points {len(entries)}: {fmt({s: sum(g[s] for g in groups.values()) for s in COVERAGE_STATES + ['blank']})}; "
-          f"invariants {len(invs)}: {fmt(inv_counts)}")
+    allc = {s: sum(g[s] for g in groups.values()) for s in COVERAGE_STATES + ["blank"]}
+    has_http = any(r["kind"] in ("http", "webhook") for r in entries)
+    parts = [f"permission-guarded write entry points {sum(gw.values())}: {fmt(gw)}"] if has_http else []
+    if "client entry points" in groups:
+        kinds = {}
+        for r in entries:
+            if r["kind"] in APP_KINDS:
+                kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        ga = groups["client entry points"]
+        parts.append(f"client entry points {sum(ga.values())} ({', '.join(f'{k} {kinds[k]}' for k in ENTRY_KINDS if k in kinds)}): "
+                     f"{fmt(ga)}")
+    parts.append(f"all entry points {len(entries)}: {fmt(allc)}" if entries or not empty
+                 else f"all entry points 0 (empty scope: {empty})")
+    parts.append(f"invariants {len(invs)}: {fmt(inv_counts)}")
+    print("report header: " + "; ".join(parts))
     if bad_cells:
         for p in bad_cells[:15]:
             print(f"FAIL {p}", file=sys.stderr)
@@ -4076,13 +4454,14 @@ def main(argv=None):
     p.add_argument("--invariants", help="init: model.md (or any file) with `- I1: …` invariant lines")
     p.add_argument("--rows", help="set: row ids, e.g. E001,E004-E010,I2")
     p.add_argument("--match", help="set: glob or substring on route/location (invariants: on the text)")
-    p.add_argument("--kind", choices=["http", "webhook", "action", "schedule", "event", "queue"])
-    p.add_argument("--group", choices=["permission-guarded writes", "other writes", "reads", "jobs, events, queues, actions"])
+    p.add_argument("--kind", choices=ENTRY_KINDS)
+    p.add_argument("--group", choices=ENTRY_GROUPS)
     p.add_argument("--axis", help=f"set: {','.join(COVERAGE_AXES)} or all (default all)")
     p.add_argument("--checked", help="set: evidence reference (file, test, hypothesis id)")
     p.add_argument("--out-of-scope", help="set: reason")
     p.add_argument("--not-done", help="set: reason")
     p.add_argument("--only-blank", action="store_true", help="set: leave filled cells alone")
+    p.add_argument("--empty-scope", help="set: record why the scope truly has no entry points (else 0 rows fail)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_coverage)
 
