@@ -9,6 +9,7 @@ processes this tool started are stopped.
 import argparse
 import base64
 import json
+import math
 import os
 import plistlib
 import re
@@ -772,6 +773,13 @@ _SCRIPTS = {
     # the page body is not a focused field (same rule as `blur`)
     "focused": "var e=arguments[0];return e===document.activeElement&&e!==document.body&&e!==document.documentElement;",
     "read": "var e=arguments[0];return e.value===undefined?e.textContent:e.value;",
+    # every element with the role (explicit, or the tag's own role for button/link) and its text; Python matches
+    "candidates": "var role=arguments[0],imp={button:'button,input[type=button],input[type=submit]',link:'a[href]'},"
+                  "q='[role=\"'+role.replace(/[\"\\\\]/g,'')+'\"]'+(imp[role]?','+imp[role]:''),out=[];"
+                  "document.querySelectorAll(q).forEach(function(e){var r=e.getAttribute('role');if(r&&r!==role)return;"
+                  "out.push({el:e,text:(e.innerText||e.value||'').replace(/\\s+/g,' ').trim(),"
+                  "label:(e.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim()});});return out;",
+    "metrics": "return {dpr:window.devicePixelRatio,iw:innerWidth,ih:innerHeight};",
 }
 
 
@@ -817,10 +825,9 @@ def judge_tap(before, after, device="ios"):
     raise DeviceQAError(f"빗나감: {reason}. 요소 가운데 ({before.get('x')},{before.get('y')}), 그 자리 요소 {before.get('at')}")
 
 
-def _native_tap(lock, element):
-    """A real touch placed on a still screen with no open keyboard, then checked on the page.
-    No retries: a miss is an error."""
-    ref = {W3C_ELEMENT: element}
+def _measured(lock, ref):
+    """Scroll the element into view on a still screen with no open keyboard and measure it. Anything that would
+    send a real touch elsewhere (zoom, off screen, covered, size 0, a value Appium did not send back) is an error."""
     if _js(lock, "blur"):  # a keyboard that opens or closes during Appium's calibration taps spoils it for the session
         _settle(lock, ref)
     _js(lock, "scroll", ref)
@@ -847,14 +854,18 @@ def _native_tap(lock, element):
     if before.get("covered"):  # a real touch would land on what is on top
         raise DeviceQAError(f"요소 가운데가 다른 요소에 가려져 있습니다: 그 자리 요소 {before.get('at')}. 누르지 않았습니다 — "
                             "보이는 그 요소를 지정하거나 터치가 확인 대상이 아니면 `tap --js`")
+    return before
+
+
+def _record_touches(lock, ref, before):
     token = os.urandom(8).hex()
     recorded = _js(lock, "record", ref, token)
     if isinstance(recorded, dict) and recorded.get("error"):
         before["store_error"] = recorded["error"]
-    if lock.get("device") == "android":  # a touch pointer at the measured centre (chromedriver W3C actions)
-        _touch_at(lock, before["x"], before["y"])
-    else:
-        webdriver("POST", f"{_session(lock)}/element/{element}/click", {})
+    return token
+
+
+def _await_hit(lock, before, token):
     end = time.time() + HIT_TIMEOUT
     while True:
         after = _js(lock, "after", token)
@@ -863,6 +874,19 @@ def _native_tap(lock, element):
         if after.get("hits") or not _same_url(after.get("href") or "", before.get("href") or "") or time.time() > end:
             return judge_tap(before, after, lock.get("device", "ios"))
         time.sleep(0.2)
+
+
+def _native_tap(lock, element):
+    """A real touch placed on a still screen with no open keyboard, then checked on the page.
+    No retries: a miss is an error."""
+    ref = {W3C_ELEMENT: element}
+    before = _measured(lock, ref)
+    token = _record_touches(lock, ref, before)
+    if lock.get("device") == "android":  # a touch pointer at the measured centre (chromedriver W3C actions)
+        _touch_at(lock, before["x"], before["y"])
+    else:
+        webdriver("POST", f"{_session(lock)}/element/{element}/click", {})
+    return _await_hit(lock, before, token)
 
 
 def _touch_at(lock, x, y):
@@ -887,6 +911,117 @@ def ios_tap(lock_dir, owner, selector, js=False, run=run, device="ios"):
         raise
     warning = load_warning()
     return {**result, "load_warning": warning} if warning else result
+
+
+def pick_exact(candidates, role, text):
+    """The one element with this role whose whole text (or aria-label) equals `text`, spaces collapsed. A partial
+    match is never pressed: in a device run "Japan" found a notice card titled "New Japan …" and pressed it."""
+    if not isinstance(candidates, list):
+        raise DeviceQAError(f"요소 목록을 읽지 못했습니다({candidates!r}). 누르지 않았습니다")
+    want = " ".join(str(text).split())
+    if not want:
+        raise DeviceQAError("찾을 글자가 비었습니다. 누르지 않았습니다")
+    rows = [c for c in candidates if isinstance(c, dict)]
+    hits = [c for c in rows if want in (c.get("text"), c.get("label"))]
+    if not hits:
+        near = [c.get("text") for c in rows if want.lower() in str(c.get("text") or "").lower()][:5]
+        raise DeviceQAError(f"role={role}이고 글자가 '{want}'와 완전히 같은 요소가 없습니다(role={role} {len(rows)}개"
+                            + (f", 부분 일치 {near}는 누르지 않음" if near else "") + "). 누르지 않았습니다")
+    if len(hits) > 1:
+        raise DeviceQAError(f"role={role}, 글자 '{want}'인 요소가 {len(hits)}개입니다. 하나로 정할 수 없어 누르지 않았습니다")
+    element = hits[0].get("el")
+    if not (isinstance(element, dict) and element.get(W3C_ELEMENT)):
+        raise DeviceQAError(f"요소 참조를 받지 못했습니다({element!r}). 누르지 않았습니다")
+    return element[W3C_ELEMENT]
+
+
+def _number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise DeviceQAError(f"좌표가 숫자가 아닙니다({name}={value!r}). 누르지 않았습니다")
+    return float(value)
+
+
+def device_point(device, x, y, dpr, inner_width, webview):
+    """A viewport CSS point → the screen point a real touch needs. Android `adb input tap` takes pixels: the web
+    view's pixel origin (its top margin under the status and address bars) + CSS × devicePixelRatio. iOS W3C pointer
+    actions in NATIVE_APP take points: the web view's origin + CSS × (web view width in points / innerWidth).
+    Any value that is not a finite number, or a point outside the web view, stops before the touch."""
+    x, y = _number(x, "x"), _number(y, "y")
+    if not isinstance(webview, dict):
+        raise DeviceQAError(f"웹뷰 위치를 읽지 못했습니다({webview!r}). 누르지 않았습니다")
+    left, top, width, height = (_number(webview.get(k), f"webview.{k}") for k in ("x", "y", "width", "height"))
+    if width <= 0 or height <= 0:
+        raise DeviceQAError(f"웹뷰 크기가 0입니다({webview}). 누르지 않았습니다")
+    if device == "android":
+        scale = _number(dpr, "devicePixelRatio")
+    else:
+        inner = _number(inner_width, "innerWidth")
+        scale = width / inner if inner > 0 else 0
+    if scale <= 0:
+        raise DeviceQAError(f"배율을 정할 수 없습니다(dpr={dpr!r}, innerWidth={inner_width!r}). 누르지 않았습니다")
+    px, py = round(left + x * scale), round(top + y * scale)
+    if not (left <= px <= left + width and top <= py <= top + height):
+        raise DeviceQAError(f"계산한 점 ({px},{py})이 웹뷰 {webview} 밖입니다. 누르지 않았습니다")
+    return px, py
+
+
+def _in_native(lock, step):
+    """Run `step(session)` in NATIVE_APP and come back to the page context, also when it fails."""
+    session = _session(lock)
+    context = webdriver("GET", f"{session}/context")
+    if not isinstance(context, str) or not context:
+        raise DeviceQAError(f"지금 웹 문맥을 읽지 못했습니다({context!r}). 돌아올 곳이 없어 NATIVE_APP으로 바꾸지 않았습니다")
+    webdriver("POST", f"{session}/context", {"name": "NATIVE_APP"})
+    try:
+        result = step(session)
+    except Exception as error:
+        try:
+            webdriver("POST", f"{session}/context", {"name": context})
+        except DeviceQAError as back:
+            raise DeviceQAError(f"{error} — 그리고 웹 문맥으로 돌아가지 못했습니다({back}). down 뒤 다시 up") from error
+        raise
+    webdriver("POST", f"{session}/context", {"name": context})
+    return result
+
+
+def _webview_rect(lock, device):
+    """Where the page sits on the screen: the native web view's rect (Android pixels, iOS points)."""
+    webview_class = NATIVE_BUTTONS[device][3]
+
+    def read(session):
+        found = webdriver("POST", f"{session}/elements", {"using": "xpath", "value": f"//{webview_class}"})
+        if not isinstance(found, list) or not found:
+            raise DeviceQAError(f"네이티브 화면에서 {webview_class}를 찾지 못했습니다({found!r}). 누르지 않았습니다")
+        return webdriver("GET", f"{session}/element/{next(iter(found[0].values()))}/rect")
+    return _in_native(lock, read)
+
+
+def touch(lock_dir, owner, role, text, device="ios", run=run, sdk=None):
+    """Find by role + exact text, turn its DOM centre into a screen point and press it with a real touch from
+    outside the page — Android `adb input tap`, iOS a W3C touch pointer in NATIVE_APP — then check on the page that
+    the first touch landed on it. Hover and touch state (`:hover`, `:active`) only come from such a touch; a
+    script click() makes neither."""
+    lock = _web_ready(lock_dir, owner, device)
+    element = pick_exact(_js(lock, "candidates", role), role, text)
+    ref = {W3C_ELEMENT: element}
+    before = _measured(lock, ref)
+    metrics = _js(lock, "metrics")
+    if not isinstance(metrics, dict):
+        raise DeviceQAError(f"배율을 읽지 못했습니다({metrics!r}). 누르지 않았습니다")
+    webview = _webview_rect(lock, device)
+    x, y = device_point(device, before.get("x"), before.get("y"), metrics.get("dpr"), metrics.get("iw"), webview)
+    if device == "android" and not lock.get("serial"):
+        raise DeviceQAError("잠금에 에뮬레이터 serial이 없습니다. 누르지 않았습니다 — `android down` 뒤 다시 up")
+    token = _record_touches(lock, ref, before)
+    if device == "android":
+        run([find_sdk(sdk) / "platform-tools/adb", "-s", lock["serial"], "shell", "input", "tap", str(x), str(y)])
+        via = "adb input tap"
+    else:
+        _in_native(lock, lambda session: _touch_at(lock, x, y))
+        via = "w3c touch pointer (NATIVE_APP)"
+    result = _await_hit(lock, before, token)
+    return {**result, "via": via, "point": [x, y], "css": [before.get("x"), before.get("y")],
+            "dpr": metrics.get("dpr"), "webview": webview}
 
 
 def ios_type(lock_dir, owner, text, selector=None, clear=False, run=run, device="ios"):
@@ -1549,6 +1684,8 @@ def main(argv=None):
         (ios, "tap"): [("selector", {}), ("--js", {"action": "store_true", "help": "실제 터치 대신 스크립트 click"})],
         (ios, "type"): [("text", {}), ("--selector", {"help": "없으면 포커스된 요소"}),
                          ("--clear", {"action": "store_true", "help": "입력 전에 값 비우기"})],
+        (ios, "touch"): [("--role", {"required": True, "help": "role 속성(button·link는 태그 기본 role 포함), 예: tab"}),
+                          ("--text", {"required": True, "help": "보이는 글자 또는 aria-label과 완전히 같은 값"})],
         (ios, "shot"): [("path", {})], (ios, "dismiss"): [],
         (ios, "permission"): [("resource", {"choices": tuple(sorted(PERMISSION_LABELS))}),
                                ("action", {"choices": ("allow", "deny", "close", "inspect")})],
@@ -1567,6 +1704,7 @@ def main(argv=None):
         (android, "open"): [("url", {})], (android, "eval"): [("expression", {"nargs": "?"}), ("--script", {})],
         (android, "tap"): [("selector", {}), ("--js", {"action": "store_true"})],
         (android, "type"): [("text", {}), ("--selector", {}), ("--clear", {"action": "store_true"})],
+        (android, "touch"): [("--role", {"required": True}), ("--text", {"required": True}), ("--sdk", {})],
         (android, "dismiss"): [],
         (android, "permission"): [("resource", {"choices": tuple(sorted(PERMISSION_LABELS))}),
                                    ("action", {"choices": ("allow", "deny", "close", "inspect")})],
@@ -1603,6 +1741,7 @@ def main(argv=None):
                 "open": lambda: ios_open(lock_dir, o, args.url),
                 "eval": lambda: ios_eval(lock_dir, o, args.expression, script=_script(args.script)),
                 "tap": lambda: ios_tap(lock_dir, o, args.selector, js=args.js),
+                "touch": lambda: touch(lock_dir, o, args.role, args.text),
                 "type": lambda: ios_type(lock_dir, o, args.text, selector=args.selector, clear=args.clear),
                 "dismiss": lambda: ios_dismiss(lock_dir, o),
                 "permission": lambda: permission(lock_dir, o, args.resource, args.action),
@@ -1624,6 +1763,7 @@ def main(argv=None):
                 "open": lambda: android_open(lock_dir, o, args.url),
                 "eval": lambda: android_eval(lock_dir, o, args.expression, script=_script(args.script)),
                 "tap": lambda: android_tap(lock_dir, o, args.selector, js=args.js),
+                "touch": lambda: touch(lock_dir, o, args.role, args.text, device="android", sdk=args.sdk),
                 "type": lambda: android_type(lock_dir, o, args.text, selector=args.selector, clear=args.clear),
                 "dismiss": lambda: android_dismiss(lock_dir, o),
                 "permission": lambda: permission(lock_dir, o, args.resource, args.action, device="android"),

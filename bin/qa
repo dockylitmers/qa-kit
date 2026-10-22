@@ -38,7 +38,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 KIT_DIR = Path(__file__).resolve().parent.parent
 HOME = Path(os.path.expanduser("~"))
 KB_REMOTE_SLUG = "dockylitmers/qa-knowledge"
@@ -53,6 +53,9 @@ SEVERITY = {"critical", "high", "medium", "low"}
 VERDICTS = {"accepted", "false_positive", "wont_fix", "duplicate"}
 REVIEW_VERDICTS = {"refuted", "stands", "downgraded", "uncertain"}
 EVIDENCE_LEVELS = {"L0", "L1", "L2", "L3", "L4", "L5", "LD"}  # LD: reproduced on a device (device-qa)
+# An LD reproduction is written next to the report it reproduces; only `same` counts as reproduced.
+REPRO_MATCH = {"same", "similar", "different"}
+REPRO_KEYS = ("original", "mine", "match")
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 PATTERN_REQUIRED = [
     "id", "status", "tier", "failure_class", "title", "scope", "probe", "oracle",
@@ -808,6 +811,20 @@ def check_eval(kb: Path, path: Path, errors, warnings, ids, pattern_ids):
             warnings.append(f"{where}: linked pattern {lp} not found")
 
 
+def repro_errors(repro) -> list:
+    """LD evidence needs the report's action and end state, mine, and whether they match; only `same` is LD."""
+    if not isinstance(repro, dict):
+        return ["no reproduction record (original action · end state / my action · end state / match)"]
+    errs = [f"reproduction '{k}' is empty" for k in REPRO_KEYS if not str(repro.get(k) or "").strip()]
+    match = repro.get("match")
+    if match and match not in REPRO_MATCH:
+        errs.append(f"reproduction match '{match}' not in {sorted(REPRO_MATCH)}")
+    elif match and match != "same":
+        errs.append(f"reproduction match is '{match}': only 'same' is a reproduction — "
+                    "record a similar symptom as L0 or a confirmation request")
+    return errs
+
+
 def check_ledger(kb: Path, lf: Path, errors, warnings=None, pattern_ids=None):
     where = rel(kb, lf)
     warnings = warnings if warnings is not None else []
@@ -835,6 +852,9 @@ def check_ledger(kb: Path, lf: Path, errors, warnings=None, pattern_ids=None):
             missing = [k for k in ("assumptions", "frequency", "severity_basis") if not ev.get(k)]
             if missing:
                 warnings.append(f"{where}:{n}: finding {ev.get('id')} lacks {', '.join(missing)}")
+            if ev.get("evidence") == "LD":
+                for e in repro_errors(ev.get("repro")):
+                    errors.append(f"{where}:{n}: finding {ev.get('id')} (LD): {e}")
             seen.add(ev.get("id"))
         elif t == "review":
             if ev.get("finding") not in seen:
@@ -917,6 +937,14 @@ def run_check(kb: Path):
     for lf in ledger_files(kb):
         check_ledger(kb, lf, errors, warnings, set(ids))
     check_calibration(kb, errors)
+    for pyaml in sorted((kb / "projects").glob("*/project.yaml")):
+        try:
+            owners = load_yaml_file(pyaml).get("owners")
+        except YamlError as e:
+            errors.append(f"{rel(kb, pyaml)}: invalid YAML ({e})")
+            continue
+        for e in owner_table_errors(owners):
+            errors.append(f"{rel(kb, pyaml)}: {e}")
     audit_eval_links(kb, warnings)
 
     # Global patterns, the global index and severity calibration: no client names, code paths or secrets.
@@ -1395,6 +1423,13 @@ def cmd_finding(args):
         if not (args.assumption and args.frequency and args.severity_basis):
             die("finding add needs --assumption (repeatable; 'none' if there is none), --frequency "
                 "and --severity-basis: severity is judged against realistic frequency and preconditions")
+        repro = None
+        if args.evidence == "LD" or args.repro_original or args.repro_mine or args.repro_match:
+            repro = {"original": args.repro_original, "mine": args.repro_mine, "match": args.repro_match}
+            errs = repro_errors(repro) if args.evidence == "LD" else []
+            if errs:
+                die("finding add --evidence LD needs --repro-original '<report: action · end state>', "
+                    "--repro-mine '<mine: action · end state>' and --repro-match same: " + "; ".join(errs))
         lf = ledger_path(kb, args.project, args.run, create=True)
         existing = [ev for _, ev in read_ledger(lf) if ev.get("type") == "finding"]
         fid = f"F{len(existing) + 1:03d}"
@@ -1402,7 +1437,7 @@ def cmd_finding(args):
               "evidence": args.evidence, "failure_class": args.cls, "location": args.location,
               "patterns": patterns, "out_of_pattern": not patterns, "summary": args.summary,
               "assumptions": args.assumption, "frequency": args.frequency,
-              "severity_basis": args.severity_basis, "at": now_iso()}
+              "severity_basis": args.severity_basis, "repro": repro, "at": now_iso()}
         append_event(lf, {k: v for k, v in ev.items() if v not in (None, "")})
         refresh_stats(kb, set(patterns))
         print(f"{fid} added to {rel(kb, lf)}")
@@ -1530,7 +1565,8 @@ def cmd_calibration(args):
 PROPOSAL_ITEM_RE = re.compile(r"^## (P\d+)\b[ \t]*(.*)$", re.M)
 PROPOSAL_BLOCK_RE = re.compile(r"^```qa-apply[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
 PROPOSAL_OPS = {"new-pattern", "append", "replace-item", "set", "body-append", "attribute", "link-eval",
-                "notes-append"}
+                "notes-append", "project-set"}
+PROJECT_SET_KEYS = {"owners", "issue_tracker", "repo_paths"}
 DECISIONS = {"pending", "approved", "rejected"}
 SET_FORBIDDEN = {"id", "tier", "stats", "provenance", "eval_links"}
 
@@ -1797,6 +1833,27 @@ def apply_proposal_item(kb: Path, spec: dict, source: str, touched: dict) -> str
         remember(notes)
         notes.write_text(insert_under_heading(text, spec["section"], line), encoding="utf-8")
         return f"{proj} notes '{spec['section']}' += 1 line"
+    if op == "project-set":
+        proj, key = spec.get("project"), spec.get("key")
+        pyaml = kb / "projects" / str(proj) / "project.yaml"
+        if not pyaml.exists():
+            die(f"project-set: no {rel(kb, pyaml)}")
+        if key not in PROJECT_SET_KEYS:
+            die(f"project-set {proj}: key must be one of {sorted(PROJECT_SET_KEYS)}")
+        value = spec.get("value")
+        if value in (None, "", [], {}):
+            die(f"project-set {proj}.{key}: needs a value")
+        if load_yaml_file(pyaml).get(key) == value:
+            return f"{proj} project.yaml {key}: already set"
+        remember(pyaml)
+        text = pyaml.read_text(encoding="utf-8")
+        line = f"{key}: {yaml_flow(value)}"
+        m = re.search(rf"(?m)^{re.escape(key)}:.*$", text)
+        text = (text[:m.start()] + line + text[m.end():]) if m else text.rstrip("\n") + "\n" + line + "\n"
+        pyaml.write_text(text, encoding="utf-8")
+        if load_yaml_file(pyaml).get(key) != value:
+            die(f"project-set {proj}.{key}: value did not round-trip")
+        return f"{proj} project.yaml {key} set"
     die(f"unknown op {op}")
 
 
@@ -1899,6 +1956,170 @@ def cmd_proposal(args):
               f"index: {', '.join(index_written) or 'up to date'}; qa check: 0 errors")
         return 0
     die(f"unknown proposal action {args.action}")
+
+
+# --------------------------------------------------------------------------
+# qa report — defect cards in report.md: LD reproduction record, suggested assignee from the owner table
+# --------------------------------------------------------------------------
+
+CARD_FIELD_RE = re.compile(r"^\*\*(?P<key>[^*]+?):\*\*[ \t]*(?P<value>.*)$")
+REPRO_CARD_KEYS = {"Original action · end state": "original", "My action · end state": "mine", "Match": "match"}
+CARD_MATCH = {"same": "same", "similar symptom": "similar", "similar": "similar", "different": "different"}
+
+
+def owner_table_errors(owners) -> list:
+    """`owners` in project.yaml: {area: [login, …]}; absent is fine (assignees are then left blank)."""
+    if owners is None:
+        return []
+    if not isinstance(owners, dict) or not owners:
+        return ["owners must be a mapping {area: [login, …]}"]
+    return [f"owners.{area} must be a non-empty list of logins" for area, who in owners.items()
+            if not (isinstance(who, list) and who and all(isinstance(x, str) and x.strip() for x in who))]
+
+
+def project_owners(kb: Path, project: str):
+    pyaml = kb / "projects" / project / "project.yaml"
+    if not pyaml.exists():
+        die(f"unknown project {project}; run `qa init {project}`")
+    owners = load_yaml_file(pyaml).get("owners")
+    errs = owner_table_errors(owners)
+    if errs:
+        die(f"projects/{project}/project.yaml: {'; '.join(errs)}")
+    return owners
+
+
+def suggest_assignees(owners, areas):
+    """Owners of every area in order, each once. Returns (logins, unknown areas); no table → ([], areas)."""
+    if not owners:
+        return [], list(areas)
+    table = {str(k).strip().lower(): v for k, v in owners.items()}
+    out, unknown = [], []
+    for a in areas:
+        who = table.get(a.strip().lower())
+        if who is None:
+            unknown.append(a)
+            continue
+        out += [x for x in who if x not in out]
+    return out, unknown
+
+
+def split_cards(text: str):
+    """Defect cards: `### ` blocks that carry an `**Evidence level:**` line. Yields (start, end, fields)."""
+    lines = text.split("\n")
+    heads = [i for i, x in enumerate(lines) if x.startswith("### ")] + [len(lines)]
+    for a, b in zip(heads, heads[1:]):
+        end = next((i for i in range(a + 1, b) if lines[i].startswith("## ")), b)
+        fields = {}
+        for i in range(a + 1, end):
+            m = CARD_FIELD_RE.match(lines[i].strip())
+            if m:
+                fields.setdefault(m.group("key").strip(), (i, m.group("value").strip()))
+        if "Evidence level" in fields:
+            yield a, end, fields
+
+
+def card_title(lines, a) -> str:
+    return lines[a][4:].strip()[:70]
+
+
+def card_value(fields, key) -> str:
+    v = fields.get(key, (None, ""))[1]
+    return "" if v.startswith("<") else v
+
+
+def card_list(value: str):
+    return [x.strip().lstrip("@") for x in re.split(r"[,/]| and ", value) if x.strip() and not x.strip().startswith("(")]
+
+
+def report_card_errors(text: str, owners=None, check_assignee=False):
+    lines, errors = text.split("\n"), []
+    for a, _end, f in split_cards(text):
+        title = card_title(lines, a)
+        if re.search(r"\bLD\b", f["Evidence level"][1]):
+            repro = {v: card_value(f, k) for k, v in REPRO_CARD_KEYS.items()}
+            if repro["match"]:
+                repro["match"] = CARD_MATCH.get(repro["match"].split("—")[0].strip().lower(), repro["match"])
+            for e in repro_errors(repro):
+                errors.append(f"{title}: LD {e}")
+        if not check_assignee:
+            continue
+        given = card_list(card_value(f, "Suggested assignee"))
+        areas = card_list(card_value(f, "Area"))
+        if not owners:
+            if given:
+                errors.append(f"{title}: Suggested assignee {given} but the project has no owner table — "
+                              "leave it blank and ask the lead")
+            continue
+        if not areas:
+            errors.append(f"{title}: no **Area:** line, so the assignee cannot come from the owner table")
+            continue
+        want, unknown = suggest_assignees(owners, areas)
+        if unknown:
+            errors.append(f"{title}: area {unknown} is not in the owner table {sorted(owners)}")
+        elif given != want:
+            errors.append(f"{title}: Suggested assignee {given or '(blank)'} differs from the owner table {want} — "
+                          "run `qa report assign`")
+    return errors
+
+
+def assign_cards(text: str, owners):
+    """Fill `**Suggested assignee:**` of every card from its `**Area:**` and the owner table."""
+    lines, notes = text.split("\n"), []
+    for a, _end, f in reversed(list(split_cards(text))):
+        title = card_title(lines, a)
+        areas = card_list(card_value(f, "Area"))
+        want, unknown = suggest_assignees(owners, areas)
+        if not owners:
+            notes.append(f"{title}: no owner table — left blank, ask the lead")
+            want = []
+        elif not areas:
+            notes.append(f"{title}: no **Area:** line — left blank, ask the lead")
+        elif unknown:
+            notes.append(f"{title}: area {unknown} not in the owner table — left blank, ask the lead")
+            want = []
+        line = f"**Suggested assignee:** {', '.join(want)}".rstrip()
+        if "Suggested assignee" in f:
+            lines[f["Suggested assignee"][0]] = line
+        else:
+            at = f.get("Area", f["Evidence level"])[0]
+            lines.insert(at + 1, line)
+    return "\n".join(lines), list(reversed(notes))
+
+
+def cmd_report(args):
+    kb = resolve_kb(args.kb)
+    if args.action == "owners":
+        owners = project_owners(kb, args.project)
+        want, unknown = suggest_assignees(owners, split_list(args.area))
+        if not owners:
+            die(f"no owner table in projects/{args.project}/project.yaml: leave the assignee blank and ask the lead")
+        if unknown:
+            die(f"area {unknown} not in the owner table {sorted(owners)}: leave the assignee blank and ask the lead")
+        print(", ".join(want))
+        return 0
+    if not args.file:
+        die(f"report {args.action} needs the report file")
+    path = Path(args.file)
+    if not path.exists():
+        die(f"no report file {args.file}")
+    text = path.read_text(encoding="utf-8")
+    owners = project_owners(kb, args.project) if args.project else None
+    if args.action == "assign":
+        if not args.project:
+            die("report assign needs --project")
+        new, notes = assign_cards(text, owners)
+        if new != text:
+            path.write_text(new, encoding="utf-8")
+        for n in notes:
+            print(f"NOTE  {n}")
+        print(f"{path.name}: {sum(1 for _ in split_cards(new))} card(s), assignees from "
+              f"projects/{args.project}/project.yaml owners" if owners else f"{path.name}: no owner table, assignees blank")
+        return 0
+    errors = report_card_errors(text, owners, check_assignee=bool(args.project))
+    for e in errors:
+        print(f"ERROR {e}")
+    print(f"qa report check: {sum(1 for _ in split_cards(text))} card(s) — {len(errors)} errors")
+    return 1 if errors else 0
 
 
 # --------------------------------------------------------------------------
@@ -4375,6 +4596,9 @@ def main(argv=None):
                    help="environment assumption / precondition (repeatable; 'none' if there is none)")
     p.add_argument("--frequency", help="realistic frequency in normal operation, with why")
     p.add_argument("--severity-basis", help="why this severity (impact x frequency x preconditions)")
+    p.add_argument("--repro-original", help="add, LD: the report's action and end state")
+    p.add_argument("--repro-mine", help="add, LD: my action and end state on the device")
+    p.add_argument("--repro-match", choices=sorted(REPRO_MATCH), help="add, LD: same (only this is LD) | similar | different")
     p.add_argument("--finding", help="finding id for review/judge, e.g. F001")
     p.add_argument("--round", type=int, help="review: 1 = in-run refutation, 2 = pre-report refutation in a fresh context")
     p.add_argument("--verdict", help="review: refuted|stands|downgraded|uncertain; judge: accepted|false_positive|wont_fix|duplicate")
@@ -4411,6 +4635,13 @@ def main(argv=None):
     p.add_argument("--items", help="apply: only these approved items")
     p.add_argument("--dry-run", action="store_true", help="apply: apply, check, report, then roll back")
     p.set_defaults(fn=cmd_proposal)
+
+    p = sub.add_parser("report", help="check|assign|owners defect cards in report.md (LD record, assignee from owners)")
+    p.add_argument("action", choices=["check", "assign", "owners"])
+    p.add_argument("file", nargs="?", help="check/assign: the run's report.md")
+    p.add_argument("--project", help="check: also check Suggested assignee against the owner table; assign/owners: required")
+    p.add_argument("--area", help="owners: comma-separated areas, e.g. web,server")
+    p.set_defaults(fn=cmd_report)
 
     p = sub.add_parser("issue", help="search existing issues (closed ones too) and recorded won't-fix decisions")
     p.add_argument("action", choices=["search"])

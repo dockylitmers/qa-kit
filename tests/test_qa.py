@@ -26,6 +26,8 @@ def cli(kb, *args):
     return r.returncode, r.stdout + r.stderr
 
 
+REPRO_SAME = ("--repro-original", "switch tab: label black, orange after scroll",
+              "--repro-mine", "switch tab by real touch: label black 5/6, orange after scroll", "--repro-match", "same")
 FINDING_CONTEXT = ("--assumption", "webhook registered", "--frequency", "rare: needs a ms window",
                    "--severity-basis", "money moves but alerts fire")
 
@@ -196,12 +198,35 @@ class CliTests(unittest.TestCase):
         kb = self.kb
         self.assertEqual(cli(kb, "init", "demo")[0], 0)
         code, out = cli(kb, "finding", "add", "--project", "demo", "--run", "r1", "--title", "result lost on return",
-                        "--severity", "high", "--evidence", "LD", *FINDING_CONTEXT)
+                        "--severity", "high", "--evidence", "LD", *FINDING_CONTEXT, *REPRO_SAME)
         self.assertEqual(code, 0, out)
         self.assertEqual(cli(kb, "check")[0], 0)
         code, out = cli(kb, "finding", "add", "--project", "demo", "--run", "r1", "--title", "x",
                         "--severity", "low", "--evidence", "L9", *FINDING_CONTEXT)
         self.assertNotEqual(code, 0)
+
+    def test_ld_finding_needs_three_reproduction_cells(self):
+        kb = self.kb
+        cli(kb, "init", "demo")
+        base = ("finding", "add", "--project", "demo", "--run", "r1", "--title", "x", "--severity", "low",
+                "--evidence", "LD", *FINDING_CONTEXT)
+        code, out = cli(kb, *base)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--repro-original", out)
+        code, out = cli(kb, *base, "--repro-original", "a", "--repro-mine", "b", "--repro-match", "similar")
+        self.assertNotEqual(code, 0)
+        self.assertIn("only 'same' is a reproduction", out)
+        self.assertEqual(cli(kb, *base, *REPRO_SAME)[0], 0)
+        self.assertEqual(cli(kb, "check")[0], 0)
+        # a ledger line written by hand without the record fails qa check
+        lf = kb / "projects/demo/runs/r1/findings.jsonl"
+        with lf.open("a") as f:
+            f.write(json.dumps({"type": "finding", "id": "F002", "title": "y", "severity": "low", "evidence": "LD",
+                                "assumptions": ["none"], "frequency": "f", "severity_basis": "b",
+                                "at": "2026-10-22T00:00:00Z"}) + "\n")
+        code, out = cli(kb, "check")
+        self.assertEqual(code, 1, out)
+        self.assertIn("F002 (LD): no reproduction record", out)
 
     def test_device_skill_is_client_neutral(self):
         import re
@@ -1070,6 +1095,172 @@ class AppEntryPointTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertRegex(out, r"client entry points \d+ \(screen 4, deeplink 7, push 1, external 5\)")
         self.assertNotIn("permission-guarded write", out.split("report header:")[1])
+
+
+CARD = """### {title}
+
+**Severity:** low — visual only
+**Evidence level:** {level}
+**Area:** {area}
+{extra}
+#### Steps to reproduce
+1. …
+"""
+
+
+class ReportCardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.kb = make_kb(self.root)
+        cli(self.kb, "init", "demo")
+        self.report = self.root / "report.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def set_owners(self):
+        pyaml = self.kb / "projects/demo/project.yaml"
+        pyaml.write_text(pyaml.read_text() + "owners: {web: [alice], frontend: [alice], server: [bob]}\n")
+
+    def write(self, *cards):
+        self.report.write_text("# Report\n\n## Defects\n\n" + "\n".join(cards) + "\n## Refuted\n\n- none\n")
+
+    def test_ld_card_without_three_cells_is_an_error(self):
+        self.write(CARD.format(title="Tab label stays black", level="LD device", area="web", extra=""),
+                   CARD.format(title="Code only", level="L1 failing test", area="server", extra=""))
+        code, out = cli(self.kb, "report", "check", str(self.report))
+        self.assertEqual(code, 1, out)
+        self.assertIn("Tab label stays black: LD reproduction 'original' is empty", out)
+        self.assertNotIn("Code only", out)
+        similar = ("**Original action · end state:** switch tab → black, orange after scroll\n"
+                   "**My action · end state:** tap the selected tab again → black until next touch\n"
+                   "**Match:** similar symptom\n")
+        self.write(CARD.format(title="Tab label stays black", level="LD device", area="web", extra=similar))
+        code, out = cli(self.kb, "report", "check", str(self.report))
+        self.assertEqual(code, 1, out)
+        self.assertIn("only 'same' is a reproduction", out)
+        self.write(CARD.format(title="Tab label stays black", level="LD device", area="web",
+                               extra=similar.replace("similar symptom", "same")))
+        code, out = cli(self.kb, "report", "check", str(self.report))
+        self.assertEqual(code, 0, out)
+
+    def test_assignee_comes_from_the_owner_table(self):
+        self.write(CARD.format(title="Web card", level="L0 code", area="web", extra="**Suggested assignee:** bob\n"),
+                   CARD.format(title="Both card", level="L0 code", area="web, server", extra=""))
+        # no owner table: a filled assignee is an error, assign leaves it blank and says to ask the lead
+        code, out = cli(self.kb, "report", "check", str(self.report), "--project", "demo")
+        self.assertEqual(code, 1, out)
+        self.assertIn("no owner table", out)
+        code, out = cli(self.kb, "report", "assign", str(self.report), "--project", "demo")
+        self.assertEqual(code, 0, out)
+        self.assertIn("ask the lead", out)
+        self.assertNotIn("**Suggested assignee:** bob", self.report.read_text())
+        self.set_owners()
+        code, out = cli(self.kb, "report", "assign", str(self.report), "--project", "demo")
+        self.assertEqual(code, 0, out)
+        text = self.report.read_text()
+        self.assertIn("**Area:** web\n**Suggested assignee:** alice\n", text)
+        self.assertIn("**Area:** web, server\n**Suggested assignee:** alice, bob\n", text)
+        self.assertEqual(cli(self.kb, "report", "check", str(self.report), "--project", "demo")[0], 0)
+        self.report.write_text(text.replace("**Suggested assignee:** alice\n", "**Suggested assignee:** bob\n", 1))
+        code, out = cli(self.kb, "report", "check", str(self.report), "--project", "demo")
+        self.assertEqual(code, 1, out)
+        self.assertIn("differs from the owner table ['alice']", out)
+        code, out = cli(self.kb, "report", "owners", "--project", "demo", "--area", "server,web")
+        self.assertEqual((code, out.strip()), (0, "bob, alice"))
+        self.assertNotEqual(cli(self.kb, "report", "owners", "--project", "demo", "--area", "infra")[0], 0)
+
+    def test_owner_table_by_proposal_and_checked(self):
+        prop = self.kb / "proposals/p.md"
+        prop.write_text("# p\n\n## P1 — project-set: demo owners\n```qa-apply\nop: project-set\nproject: demo\n"
+                        "key: owners\nvalue: {web: [alice], server: [bob]}\ndecision: approved\n```\n")
+        code, out = cli(self.kb, "proposal", "apply", "p.md")
+        self.assertEqual(code, 0, out)
+        meta = qa.load_yaml_file(self.kb / "projects/demo/project.yaml")
+        self.assertEqual(meta["owners"], {"web": ["alice"], "server": ["bob"]})
+        self.assertEqual(meta["name"], "demo")
+        pyaml = self.kb / "projects/demo/project.yaml"
+        pyaml.write_text(pyaml.read_text().replace("server: [bob]", "server: []"))
+        code, out = cli(self.kb, "check")
+        self.assertEqual(code, 1, out)
+        self.assertIn("owners.server must be a non-empty list", out)
+
+
+DQ_PATH = KIT / "skills/device-qa/scripts/device_qa.py"
+dq_spec = importlib.util.spec_from_file_location("device_qa", DQ_PATH)
+dq = importlib.util.module_from_spec(dq_spec)
+dq_spec.loader.exec_module(dq)
+
+
+class DeviceTouchTests(unittest.TestCase):
+    EL = dq.W3C_ELEMENT
+
+    def test_android_point_uses_dpr_and_webview_top(self):
+        # 393x851 CSS viewport at dpr 2.75 under a 236 px status + address bar
+        webview = {"x": 0, "y": 236, "width": 1080, "height": 2084}
+        self.assertEqual(dq.device_point("android", 196, 30, 2.75, 393, webview), (539, 318))
+
+    def test_ios_point_uses_points_and_webview_origin(self):
+        webview = {"x": 0, "y": 59, "width": 393, "height": 700}
+        self.assertEqual(dq.device_point("ios", 100, 20, 3, 393, webview), (100, 79))
+
+    def test_non_numeric_or_outside_point_stops(self):
+        webview = {"x": 0, "y": 236, "width": 1080, "height": 2084}
+        for bad in (None, "196px", float("nan"), True):
+            with self.assertRaisesRegex(dq.DeviceQAError, "좌표가 숫자가 아닙니다.*누르지 않았습니다"):
+                dq.device_point("android", bad, 30, 2.75, 393, webview)
+        with self.assertRaisesRegex(dq.DeviceQAError, "좌표가 숫자가 아닙니다"):
+            dq.device_point("android", 10, 10, 2.75, 393, {**webview, "y": None})
+        with self.assertRaisesRegex(dq.DeviceQAError, "밖입니다"):
+            dq.device_point("android", 10, 900, 2.75, 393, webview)
+
+    def test_exact_match_only(self):
+        rows = [{"el": {self.EL: "a"}, "text": "New Japan travel notice", "label": ""},
+                {"el": {self.EL: "b"}, "text": "Japan", "label": ""},
+                {"el": {self.EL: "c"}, "text": "Korea", "label": "Korea tab"}]
+        self.assertEqual(dq.pick_exact(rows, "tab", " Japan "), "b")
+        self.assertEqual(dq.pick_exact(rows, "tab", "Korea tab"), "c")
+        with self.assertRaisesRegex(dq.DeviceQAError, "부분 일치.*누르지 않았습니다"):
+            dq.pick_exact(rows[:1], "tab", "Japan")
+        with self.assertRaisesRegex(dq.DeviceQAError, "2개"):
+            dq.pick_exact(rows + [{"el": {self.EL: "d"}, "text": "Japan"}], "tab", "Japan")
+
+    def fake_touch(self, device, metrics, webview):
+        calls, adb = [], []
+        lock = {"device": device, "serial": "emulator-5584", "port": 1, "session_id": "s"}
+        before = {"x": 196, "y": 30, "w": 80, "h": 40, "visible": True, "covered": False, "href": "u", "zoom": 1}
+
+        def js(_lock, tag, *args):
+            calls.append(tag)
+            return {"candidates": [{"el": {self.EL: "e1"}, "text": "Japan"}], "metrics": metrics,
+                    "record": {"stored": True}}.get(tag)
+
+        patches = {"_web_ready": lambda *a, **k: lock, "_js": js, "_measured": lambda *a: dict(before),
+                   "_webview_rect": lambda *a: webview, "find_sdk": lambda sdk=None: Path("/sdk"),
+                   "_in_native": lambda lk, step: step("s"), "_touch_at": lambda lk, x, y: adb.append(("w3c", x, y)),
+                   "_await_hit": lambda *a: {"hit": True}}
+        saved = {k: getattr(dq, k) for k in patches}
+        try:
+            for k, v in patches.items():
+                setattr(dq, k, v)
+            result = dq.touch(None, "o", "tab", "Japan", device=device, run=lambda cmd, check=True: adb.append(cmd))
+        finally:
+            for k, v in saved.items():
+                setattr(dq, k, v)
+        return result, adb, calls
+
+    def test_touch_presses_with_adb_or_w3c_pointer(self):
+        result, sent, calls = self.fake_touch("android", {"dpr": 2.75, "iw": 393}, {"x": 0, "y": 236, "width": 1080, "height": 2084})
+        self.assertEqual(sent, [[Path("/sdk/platform-tools/adb"), "-s", "emulator-5584", "shell", "input", "tap", "539", "318"]])
+        self.assertEqual((result["via"], result["point"]), ("adb input tap", [539, 318]))
+        self.assertNotIn("jsclick", calls)
+        result, sent, _ = self.fake_touch("ios", {"dpr": 3, "iw": 393}, {"x": 0, "y": 59, "width": 393, "height": 700})
+        self.assertEqual(sent, [("w3c", 196, 89)])
+
+    def test_touch_does_not_press_when_dpr_is_not_a_number(self):
+        with self.assertRaisesRegex(dq.DeviceQAError, "devicePixelRatio"):
+            self.fake_touch("android", {"dpr": None, "iw": 393}, {"x": 0, "y": 236, "width": 1080, "height": 2084})
 
 
 if __name__ == "__main__":

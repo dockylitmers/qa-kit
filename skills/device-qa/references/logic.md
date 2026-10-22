@@ -16,5 +16,6 @@
 4. 종료 중 오류가 나면 잠금을 남겨 다른 세션이 같은 기기를 쓰지 못하게 한다.
 5. `dismiss`는 거부·닫기 전용이고 허용은 `permission … allow`에서만 된다. `native inspect`는 읽기 전용이다.
 6. `tap`은 iOS에서 실제 터치(WebDriverAgent), Android에서 W3C touch pointer를 쓰고, 화면이 멈출 때까지 기다린 뒤 누르며, 페이지가 본 첫 터치로 맞음·빗나감을 판정한다. 확대된 페이지·가려진 요소·화면 밖 요소는 누르지 않고 오류를 낸다.
-7. 앱 모드의 `open`·`eval`·`tap`·`type`은 WEBVIEW 문맥에서만 실행한다.
+7. 앱 모드의 `open`·`eval`·`tap`·`type`·`touch`는 WEBVIEW 문맥에서만 실행한다.
 8. iOS QA 시뮬레이터(`QA-agentops-<기기>`)는 세션 사이 켜 둔 채 남긴다(빠른 재시작). 비우기는 `ios reset`만.
+9. `touch`는 `tap`과 같은 측정(멈춘 화면, 확대 없음, 가려짐 없음)을 한 뒤, 누르는 일만 페이지 밖에서 한다: Android는 `adb input tap`(픽셀), iOS는 NATIVE_APP 문맥의 W3C touch pointer(포인트). 판정은 `tap`과 같이 페이지가 본 첫 터치로 한다. 좌표 계산에 쓰는 값(요소 가운데, `devicePixelRatio`, `innerWidth`, 웹뷰 사각형) 가운데 하나라도 유한한 숫자가 아니면 누르지 않는다.

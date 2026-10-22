@@ -106,6 +106,7 @@ source: project=<p> runs=<run-ids> (verdict counts: accepted n, fp n, wont_fix n
 | `attribute` | 실행 기록의 결함을 기존 패턴에 귀속(통계가 그만큼 오름) | `project, run, finding, patterns` |
 | `link-eval` | 평가 사례 `linked_patterns`에 추가(leave-one-out에서 숨김) | `case, patterns` |
 | `notes-append` | 프로젝트 `notes.md`의 절에 한 줄(예: won't-fix 정책) | `project, section, value` |
+| `project-set` | 프로젝트 `project.yaml`의 키 하나(`owners` 담당 표, `issue_tracker`, `repo_paths`) | `project, key, value` (예: `key: owners`, `value: {web: [login], server: [login]}`) |
 
 모든 블록에 `decision: pending`을 둔다. 리드 검토 뒤:
 

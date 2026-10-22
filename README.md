@@ -75,6 +75,8 @@ qa finding add --project <p> --run <run> --title "..." --severity high --evidenc
    --class error_propagation --location "file:line" --patterns PAT-a \
    --assumption "webhook registered in production" --frequency "rare: ms window" \
    --severity-basis "money moves; needs two failures to line up"           # 세 칸 필수
+qa finding add … --evidence LD --repro-original "<신고: 조작·끝 상태>" \
+   --repro-mine "<내 조작·끝 상태, 플랫폼, n/m>" --repro-match same       # LD는 세 칸 필수, same만 LD
 qa finding review --project <p> --run <run> --finding F001 --round 1|2 \
    --verdict stands|downgraded|refuted|uncertain --severity medium --reason "..." [--corrections "..."]
 qa finding judge --project <p> --run <run> --finding F001 --verdict accepted \
@@ -84,6 +86,15 @@ qa calibration add --project <p> --run <run> --finding F001 --reason "<client-ne
 qa calibration list                                        # 처음 → 1차 → 2차 → 확정, 하향 비율
 ```
 
+- 보고 전 결함 카드 검사·담당 채우기(`report.md`):
+
+  ```sh
+  qa report assign <run>/report.md --project <p>   # 카드의 **Area:** → project.yaml owners → **Suggested assignee:**
+  qa report check <run>/report.md --project <p>    # LD 카드의 재현 세 칸·Match same, 담당이 표와 같은지(오류면 종료 코드 1)
+  qa report owners --project <p> --area web,server # 담당 표 조회
+  ```
+
+  담당 표는 `projects/<p>/project.yaml`에 둔다(`owners: {web: [login], frontend: [login], server: [login]}`, 제안 `project-set`으로 넣는다). 표가 없으면 담당 칸은 비우고 리드에게 묻는다.
 - 판정(`accepted | false_positive | wont_fix | duplicate`)이 들어오면 CLI가 쓰인 패턴의 `stats`를 실행 기록에서 다시 계산한다(LLM이 카운터를 만지지 않는다).
 - `--issue`는 그 결함이 게시된 이슈 번호다. `qa misses collect`가 키트가 낸 이슈를 빼는 근거이므로 게시 뒤 꼭 적는다.
 - 심각도 보정(`calibration/severity.jsonl`)은 고객사 이름 없이 쓴다(`qa check`가 공통 패턴과 같은 금지어 검사를 한다). 행은 실행을 가리키는 불투명 해시만 갖는다.
@@ -117,6 +128,7 @@ issue_tracker: {kind: github, repo: owner/name}            # gh issue list (읽�
 # Jira 등: JSON 배열(number,title,labels,state,stateReason,createdAt)을 출력하는 명령. 셸 없이 실행한다.
 # issue_tracker: {kind: command, list: "my-jira list --since {since} --label {label}", search: "my-jira search {query}"}
 # area_labels: 영역으로 볼 라벨만 고르려면 issue_tracker 안에 [backend, frontend, mobile]
+owners: {web: [login-a], frontend: [login-a], server: [login-b]}   # 결함 카드 Suggested assignee의 출처(qa report assign)
 ```
 
 ```sh
@@ -246,6 +258,13 @@ qa doctor --offline --target <레포 경로>   # + 대상 레포가 요구하는
 ## 나중에: 비공개 플러그인 마켓
 
 이 저장소는 이미 플러그인 모양이다(`.claude-plugin/plugin.json`, `skills/`, `agents/`, `bin/`). 기기·사람이 늘면 마켓플레이스 저장소에 `{"name": "qa-kit", "source": {"source": "github", "repo": "dockylitmers/qa-kit"}}` 항목을 두고 `claude plugin marketplace add`로 옮긴다. 플러그인 서브에이전트는 훅을 무시하고, 자동 갱신은 기본 꺼짐이며, 기기마다 git 자격 증명이 필요하다. 검사: `claude plugin validate .`
+
+## 변경 기록
+
+- **0.5.0** (2026-10-22) — 기기 화면 신고 재현 회고 반영. 재현 기록 세 칸(원문 조작·끝 상태 / 내 조작·끝 상태 / 일치)과 `같음`만 LD인 규칙, 플랫폼 없는 렌더링·터치 신고는 Android·iOS 둘 다(device-qa 5절, qa-run 6단계, `qa finding add --repro-*`, `qa check`·`qa report check`가 세 칸 없는 LD를 오류로). device-qa `touch`: role·글자 완전 일치 요소의 DOM 위치를 dpr·웹뷰 위쪽 여백으로 바꿔 Android `adb input tap`·iOS W3C pointer로 누르고, 좌표가 숫자가 아니면 멈춤. JS click()이 hover·터치 상태를 만들지 않는다는 주의. 캡처 개인정보(앞 화면 확인, 계정 정보는 가리고 찍기). 보고 전 분류 순서(명세·관리자 데이터 먼저 → 변경 요청). 담당 제안은 `project.yaml`의 `owners` 표에서(`qa report assign`, 제안 op `project-set`). 증거 전달(사진 첨부 방법을 게시 계획에, 아니면 관찰 값을 글로).
+- **0.4.1** — 커버리지 관문이 진입점 0행을 통과로 보지 않음, 앱 진입점(화면·딥링크·푸시·외부 전환) 추출.
+- **0.4.0** — 놓침 검사: 커버리지 관문, 심은 결함, 블라인드 재도출.
+- **0.3.0** — device-qa 스킬, qa-run 모드 선택, LD 증거 등급.
 
 ## 개발
 
