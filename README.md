@@ -261,6 +261,7 @@ qa doctor --offline --target <레포 경로>   # + 대상 레포가 요구하는
 
 ## 변경 기록
 
+- **0.5.1** (2026-10-22) — 화면 UX 점검표 `skills/qa-run/references/ux-heuristics.md`: 토스 제품·라이팅 원칙과 금지 다크 패턴, NN/g 10 휴리스틱, Laws of UX, Apple HIG·Android 내비게이션, Baymard 결제에서 뽑은 28칸(한 화면의 목표, 내비게이션, 선택·입력, 상태 표시, 문구, 일관성, 결제)과 결함·변경 요청·취향 분류, 출처 표. qa-run 3단계 6번(화면 × UX 점검표)과 8단계 분류, device-qa 5a절에서 연결.
 - **0.5.0** (2026-10-22) — 기기 화면 신고 재현 회고 반영. 재현 기록 세 칸(원문 조작·끝 상태 / 내 조작·끝 상태 / 일치)과 `같음`만 LD인 규칙, 플랫폼 없는 렌더링·터치 신고는 Android·iOS 둘 다(device-qa 5절, qa-run 6단계, `qa finding add --repro-*`, `qa check`·`qa report check`가 세 칸 없는 LD를 오류로). device-qa `touch`: role·글자 완전 일치 요소의 DOM 위치를 dpr·웹뷰 위쪽 여백으로 바꿔 Android `adb input tap`·iOS W3C pointer로 누르고, 좌표가 숫자가 아니면 멈춤. JS click()이 hover·터치 상태를 만들지 않는다는 주의. 캡처 개인정보(앞 화면 확인, 계정 정보는 가리고 찍기). 보고 전 분류 순서(명세·관리자 데이터 먼저 → 변경 요청). 담당 제안은 `project.yaml`의 `owners` 표에서(`qa report assign`, 제안 op `project-set`). 증거 전달(사진 첨부 방법을 게시 계획에, 아니면 관찰 값을 글로).
 - **0.4.1** — 커버리지 관문이 진입점 0행을 통과로 보지 않음, 앱 진입점(화면·딥링크·푸시·외부 전환) 추출.
 - **0.4.0** — 놓침 검사: 커버리지 관문, 심은 결함, 블라인드 재도출.
